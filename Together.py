@@ -181,6 +181,18 @@ def init_database():
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+
+    cur.execute(
+        "INSERT OR IGNORE INTO bot_settings(key, value) VALUES (?, ?)",
+        ("admin_activity_notifications", "1"),
+    )
+
     # Migration for old databases.
     try:
         cur.execute("ALTER TABLE users ADD COLUMN last_active TEXT")
@@ -220,8 +232,59 @@ def user_label(user_id):
     return f"{name} (ID {user_id})"
 
 
+def admin_activity_notifications_enabled():
+    conn = db()
+    row = conn.execute(
+        "SELECT value FROM bot_settings WHERE key=?",
+        ("admin_activity_notifications",),
+    ).fetchone()
+    conn.close()
+    return bool(row and row["value"] == "1")
+
+
+def set_admin_activity_notifications(enabled):
+    conn = db()
+    conn.execute(
+        """
+        INSERT INTO bot_settings(key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        ("admin_activity_notifications", "1" if enabled else "0"),
+    )
+    conn.commit()
+    conn.close()
+
+
+def admin_activity_toggle_keyboard():
+    enabled = admin_activity_notifications_enabled()
+    status = "🟢 Միացված է" if enabled else "🔴 Անջատված է"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"🔔 Գործողությունների հաղորդագրություններ՝ {status}",
+            callback_data="admin:toggle_activity",
+        )],
+        [InlineKeyboardButton("⬅️ Admin մենյու", callback_data="admin:menu")],
+    ])
+
+
+async def admin_activity_settings_message(query):
+    enabled = admin_activity_notifications_enabled()
+    status = "🟢 Միացված" if enabled else "🔴 Անջատված"
+    text = (
+        "🔔 <b>Բոտի ակտիվության հաղորդագրություններ</b>\n\n"
+        f"Կարգավիճակ՝ <b>{status}</b>\n\n"
+        "Երբ միացված է, Admin-ը Telegram-ում կստանա "
+        "բոտում կատարվող գրանցումների, պրոֆիլների, հավանումների, "
+        "Match-երի, հաղորդագրությունների, բողոքների և այլ գործողությունների "
+        "անմիջական ծանուցումներ։\n\n"
+        "⚠️ Անջատելու դեպքում գործողությունները չեն կորչի․ "
+        "դրանք կշարունակեն պահպանվել «📋 Վերջին գործողություններ» բաժնում։"
+    )
+    await safe_edit_to_text(query, text, admin_activity_toggle_keyboard())
+
+
 async def admin_notify(text):
-    if not ADMIN_ID:
+    if not ADMIN_ID or not admin_activity_notifications_enabled():
         return
 
     try:
@@ -463,6 +526,9 @@ def admin_menu_keyboard():
         ],
         [
             InlineKeyboardButton("📋 Վերջին գործողություններ", callback_data="admin:activity"),
+        ],
+        [
+            InlineKeyboardButton("🔔 Ակտիվության հաղորդագրություններ", callback_data="admin:activity_settings"),
         ],
         [
             InlineKeyboardButton("🔄 Թարմացնել", callback_data="admin:menu"),
@@ -1818,6 +1884,21 @@ async def admin_callback(query, context):
         return
 
     action = query.data.split(":", 1)[1] if ":" in query.data else "menu"
+
+    if action == "activity_settings":
+        await query.answer()
+        await admin_activity_settings_message(query)
+        return
+
+    if action == "toggle_activity":
+        new_value = not admin_activity_notifications_enabled()
+        set_admin_activity_notifications(new_value)
+        await query.answer(
+            "🔔 Միացված է։" if new_value else "🔕 Անջատված է։",
+            show_alert=True,
+        )
+        await admin_activity_settings_message(query)
+        return
 
     if action == "menu":
         await query.answer()
