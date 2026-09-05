@@ -28,12 +28,7 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 
-# Railway Persistent Volume:
-# Recommended Variables:
-# DB_FILE=/data/togethr.db
-# BACKUP_DIR=/data/backups
 CONFIG_DB_FILE = os.getenv("DB_FILE", "").strip()
-
 if CONFIG_DB_FILE:
     DB_FILE = CONFIG_DB_FILE
 elif os.path.isdir("/data"):
@@ -46,12 +41,10 @@ BACKUP_DIR = os.getenv(
     "/data/backups" if DB_FILE.startswith("/data/") else os.path.join(os.path.dirname(DB_FILE), "backups"),
 ).strip()
 
-
 def ensure_storage():
     db_dir = os.path.dirname(os.path.abspath(DB_FILE))
     os.makedirs(db_dir, exist_ok=True)
     os.makedirs(os.path.abspath(BACKUP_DIR), exist_ok=True)
-
     test_file = os.path.join(db_dir, ".write_test")
     try:
         with open(test_file, "w", encoding="utf-8") as f:
@@ -60,17 +53,12 @@ def ensure_storage():
     except Exception as exc:
         raise RuntimeError(
             f"Database directory is not writable: {db_dir}. "
-            f"Check the Railway Volume mount path. Error: {exc}"
+            f"Check Railway Volume mount path /data. Error: {exc}"
         ) from exc
-
 
 def db():
     ensure_storage()
-    conn = sqlite3.connect(
-        DB_FILE,
-        timeout=30,
-        check_same_thread=False,
-    )
+    conn = sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 30000")
@@ -393,9 +381,12 @@ MAIN_MENU = [
 ]
 
 
-def main_keyboard():
+def main_keyboard(user_id=None):
+    menu = [row[:] for row in MAIN_MENU]
+    if user_id is not None and admin_only(user_id):
+        menu.append(["🛡️ Admin մենյու"])
     return ReplyKeyboardMarkup(
-        MAIN_MENU,
+        menu,
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -1414,7 +1405,7 @@ async def show_home(update, context):
         try:
             await update.callback_query.message.chat.send_message(
                 "🏠 Գլխավոր մենյու",
-                reply_markup=main_keyboard(),
+                reply_markup=main_keyboard(update.effective_user.id),
             )
         except Exception:
             pass
@@ -2063,6 +2054,10 @@ async def text_router(update, context):
         await start_profile(update, context, editing=True)
         return
 
+    if text == "🛡️ Admin մենյու":
+        await admin_menu_message(update, context)
+        return
+
     # Profile flow.
     step = context.user_data.get("step")
 
@@ -2433,7 +2428,7 @@ async def start_command(update, context):
             "Togethr-ը օգնում է գտնել նոր մարդկանց և ծանոթանալ։\n\n"
             "Սկսելու համար լրացրու քո պրոֆիլը։",
             parse_mode="HTML",
-            reply_markup=main_keyboard(),
+            reply_markup=main_keyboard(user_id),
         )
         await start_profile(update, context, editing=False)
     else:
