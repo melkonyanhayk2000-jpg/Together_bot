@@ -1,7 +1,3 @@
-# TOGETHR — Telegram Dating / Social Bot
-# Complete bot file placeholder
-# The full Together.py code is generated here.
-
 import os
 import sqlite3
 import logging
