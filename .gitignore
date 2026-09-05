@@ -1,0 +1,7 @@
+togethr.db
+*.db
+*.db-wal
+*.db-shm
+backups/
+__pycache__/
+.env
