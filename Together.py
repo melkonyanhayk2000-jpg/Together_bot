@@ -1,9 +1,11 @@
+# TOGETHR — Telegram Dating / Social Bot
+# Complete bot file placeholder
+# The full Together.py code is generated here.
+
 import os
 import sqlite3
 import logging
 import html
-import shutil
-from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
@@ -11,12 +13,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-# IMPORTANT: put DB_FILE on persistent storage in production.
-# Example: DB_FILE=/data/togethr.db
 DB_FILE = os.getenv("DB_FILE", "togethr.db")
-BACKUP_DIR = os.getenv("BACKUP_DIR", "backups")
-BACKUP_INTERVAL_HOURS = int(os.getenv("BACKUP_INTERVAL_HOURS", "6"))
-BACKUP_KEEP = int(os.getenv("BACKUP_KEEP", "30"))
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger("togethr")
@@ -24,21 +21,9 @@ logger = logging.getLogger("togethr")
 APP_STARTED_AT = datetime.now(timezone.utc)
 
 
-def db_path():
-    return Path(DB_FILE).expanduser().resolve()
-
-
-def backup_dir():
-    return Path(BACKUP_DIR).expanduser().resolve()
-
-
 def db():
-    path = db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=30)
+    conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
@@ -134,119 +119,8 @@ def init_db():
     ]:
         cur.execute(sql)
 
-    # Safer SQLite settings for a long-running bot.
-    cur.execute("PRAGMA journal_mode=WAL")
-    cur.execute("PRAGMA synchronous=FULL")
-    cur.execute("PRAGMA foreign_keys=ON")
-
     conn.commit()
     conn.close()
-
-
-def database_integrity_check():
-    """Return (ok, message) without modifying user data."""
-    try:
-        conn = db()
-        row = conn.execute("PRAGMA integrity_check").fetchone()
-        conn.close()
-        result = row[0] if row else "unknown"
-        return result == "ok", result
-    except Exception as exc:
-        logger.exception("Database integrity check failed")
-        return False, str(exc)
-
-
-def create_database_backup(reason="scheduled"):
-    """Create a consistent SQLite backup using SQLite's online backup API."""
-    source = db_path()
-    target_dir = backup_dir()
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    if not source.exists():
-        return None, "Database file does not exist yet."
-
-    ok, integrity = database_integrity_check()
-    if not ok:
-        return None, f"Backup cancelled: database integrity check failed: {integrity}"
-
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    target = target_dir / f"togethr_{stamp}_{reason}.db"
-
-    src = sqlite3.connect(str(source), timeout=30)
-    dst = sqlite3.connect(str(target))
-    try:
-        src.backup(dst)
-        dst.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        dst.commit()
-    finally:
-        dst.close()
-        src.close()
-
-    # Verify the backup before considering it valid.
-    check = sqlite3.connect(str(target), timeout=30)
-    try:
-        result = check.execute("PRAGMA integrity_check").fetchone()[0]
-    finally:
-        check.close()
-
-    if result != "ok":
-        try:
-            target.unlink()
-        except OSError:
-            pass
-        return None, f"Backup verification failed: {result}"
-
-    cleanup_old_backups()
-    return target, "Backup created and verified successfully."
-
-
-def cleanup_old_backups():
-    directory = backup_dir()
-    files = sorted(
-        directory.glob("togethr_*.db"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    for old in files[max(BACKUP_KEEP, 1):]:
-        try:
-            old.unlink()
-        except OSError:
-            logger.warning("Could not delete old backup: %s", old)
-
-
-def list_backups(limit=10):
-    directory = backup_dir()
-    if not directory.exists():
-        return []
-    return sorted(
-        directory.glob("togethr_*.db"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )[:limit]
-
-
-def backup_scheduler(application):
-    """Run periodic backups without requiring the optional PTB job-queue package."""
-    import threading
-
-    def run():
-        try:
-            path, message = create_database_backup("scheduled")
-            logger.info("Automatic backup: %s | %s", path or "FAILED", message)
-        except Exception:
-            logger.exception("Automatic database backup failed")
-        finally:
-            timer = threading.Timer(
-                max(BACKUP_INTERVAL_HOURS, 1) * 3600,
-                run,
-            )
-            timer.daemon = True
-            timer.start()
-
-    # First backup shortly after startup, then periodically.
-    timer = threading.Timer(10, run)
-    timer.daemon = True
-    timer.start()
 
 
 def db_log(user_id, action, details=""):
@@ -326,7 +200,6 @@ def uptime_text():
 def admin_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Բոտի կարգավիճակ", callback_data="admin_status")],
-        [InlineKeyboardButton("💾 Database", callback_data="admin_database")],
         [InlineKeyboardButton("👥 Օգտատերեր", callback_data="admin_users")],
         [InlineKeyboardButton("🟢 Ակտիվներ", callback_data="admin_active")],
         [InlineKeyboardButton("🆕 Նոր օգտատերեր", callback_data="admin_new")],
@@ -346,131 +219,6 @@ def back_admin():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("◀️ Admin մենյու", callback_data="admin_panel")]
     ])
-
-
-def database_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💾 Ստեղծել Backup հիմա", callback_data="db_backup")],
-        [InlineKeyboardButton("🛡️ Ստուգել Database-ը", callback_data="db_check")],
-        [InlineKeyboardButton("📦 Backup-ների ցուցակ", callback_data="db_backups")],
-        [InlineKeyboardButton("🔄 Թարմացնել", callback_data="admin_database")],
-        [InlineKeyboardButton("◀️ Admin մենյու", callback_data="admin_panel")],
-    ])
-
-
-async def show_database_menu(query):
-    ok, integrity = database_integrity_check()
-    backups = list_backups(10)
-    db_exists = db_path().exists()
-    db_size = db_path().stat().st_size if db_exists else 0
-
-    status = "🟢 Անվտանգ է" if ok else "🔴 Խնդիր կա"
-    size_mb = db_size / (1024 * 1024)
-
-    text = (
-        "💾 <b>TOGETHR — DATABASE</b>\n\n"
-        f"📁 Ֆայլ՝ <code>{html.escape(str(db_path()))}</code>\n"
-        f"📦 Չափ՝ <b>{size_mb:.2f} MB</b>\n"
-        f"🛡️ Integrity՝ <b>{status}</b>\n"
-        f"🔎 Ստուգման արդյունք՝ <code>{html.escape(str(integrity))}</code>\n"
-        f"💾 Backup-ներ՝ <b>{len(list_backups(100000))}</b>\n"
-        f"🔁 Ավտոմատ Backup՝ յուրաքանչյուր <b>{max(BACKUP_INTERVAL_HOURS, 1)} ժամ</b>\n"
-        f"🗃️ Պահպանվում է առավելագույնը՝ <b>{max(BACKUP_KEEP, 1)}</b> backup\n\n"
-        "<b>Պաշտպանություն</b>\n"
-        "• SQLite WAL mode\n"
-        "• synchronous=FULL\n"
-        "• Integrity check\n"
-        "• Online SQLite backup\n"
-        "• Հին backup-ների ավտոմատ մաքրում"
-    )
-
-    await query.edit_message_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=database_keyboard(),
-    )
-
-
-async def database_backup_callback(query, application):
-    await query.edit_message_text(
-        "⏳ <b>Backup-ը ստեղծվում է...</b>",
-        parse_mode="HTML",
-    )
-    try:
-        path, message = create_database_backup("manual")
-        if path:
-            await admin_notify(
-                application,
-                "💾 <b>Database Backup</b>\n\n"
-                f"✅ Backup ստեղծվեց։\n"
-                f"📁 {html.escape(str(path))}"
-            )
-            text = (
-                "💾 <b>Backup-ը հաջողությամբ ստեղծվեց</b>\n\n"
-                f"📁 <code>{html.escape(str(path))}</code>\n"
-                "🛡️ Integrity ստուգումը՝ OK"
-            )
-        else:
-            text = "🔴 <b>Backup-ը չստեղծվեց</b>\n\n" + html.escape(message)
-    except Exception as exc:
-        logger.exception("Manual backup failed")
-        text = "🔴 <b>Backup-ի սխալ</b>\n\n" + html.escape(str(exc))
-
-    await query.edit_message_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=database_keyboard(),
-    )
-
-
-async def database_check_callback(query):
-    ok, result = database_integrity_check()
-    if ok:
-        text = (
-            "🛡️ <b>Database ստուգում</b>\n\n"
-            "🟢 Database-ը ամբողջական է և վնասվածության նշան չկա։\n\n"
-            f"Արդյունք՝ <code>{html.escape(str(result))}</code>"
-        )
-    else:
-        text = (
-            "🛡️ <b>Database ստուգում</b>\n\n"
-            "🔴 <b>Խնդիր է հայտնաբերվել։</b>\n\n"
-            f"Արդյունք՝ <code>{html.escape(str(result))}</code>"
-        )
-
-    await query.edit_message_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=database_keyboard(),
-    )
-
-
-async def database_backups_callback(query):
-    backups = list_backups(15)
-
-    if not backups:
-        text = "📦 <b>Backup-ներ</b>\n\nԴեռ backup չկա։"
-    else:
-        lines = ["📦 <b>Վերջին backup-ները</b>\n"]
-        for i, item in enumerate(backups, 1):
-            try:
-                size = item.stat().st_size / (1024 * 1024)
-                when = datetime.fromtimestamp(
-                    item.stat().st_mtime, timezone.utc
-                ).astimezone().strftime("%d.%m.%Y %H:%M")
-                lines.append(
-                    f"{i}. 💾 <code>{html.escape(item.name)}</code>\n"
-                    f"   🕐 {when} | {size:.2f} MB"
-                )
-            except OSError:
-                continue
-        text = "\n".join(lines)
-
-    await query.edit_message_text(
-        text[:3900],
-        parse_mode="HTML",
-        reply_markup=database_keyboard(),
-    )
 
 
 def stats():
@@ -707,26 +455,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_admin_status(query)
         return
 
-    if data == "admin_database":
-        if is_admin(query.from_user.id):
-            await show_database_menu(query)
-        return
-
-    if data == "db_backup":
-        if is_admin(query.from_user.id):
-            await database_backup_callback(query, context.application)
-        return
-
-    if data == "db_check":
-        if is_admin(query.from_user.id):
-            await database_check_callback(query)
-        return
-
-    if data == "db_backups":
-        if is_admin(query.from_user.id):
-            await database_backups_callback(query)
-        return
-
     if data == "admin_activity":
         if is_admin(query.from_user.id):
             await admin_activity(query)
@@ -888,17 +616,7 @@ def main():
 
     init_db()
 
-    # Never delete/replace the existing database during a code deployment.
-    # Make a verified backup before the bot starts serving users.
-    try:
-        path, message = create_database_backup("startup")
-        logger.info("Startup database backup: %s | %s", path or "not-created", message)
-    except Exception:
-        logger.exception("Startup database backup failed")
-
     application = Application.builder().token(BOT_TOKEN).build()
-
-    backup_scheduler(application)
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", admin_command))
