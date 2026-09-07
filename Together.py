@@ -1,85 +1,82 @@
 import os
-import html
-import asyncio
-import logging
 import sqlite3
-from datetime import datetime, timezone
+import logging
+from datetime import datetime, timedelta
 
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ConversationHandler, ContextTypes, filters
 )
 
-BOT_NAME = "Together"
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
-INACTIVITY_SECONDS = 180
+# =========================================================
+# SETTINGS
+# =========================================================
 
-BASE_DIR = "/data" if os.path.isdir("/data") else os.path.join(os.getcwd(), "data")
-os.makedirs(BASE_DIR, exist_ok=True)
-DB_PATH = os.path.join(BASE_DIR, "together.db")
-BACKUP_DIR = os.path.join(BASE_DIR, "backups")
-os.makedirs(BACKUP_DIR, exist_ok=True)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
+DB_FILE = os.getenv("DB_FILE", "/data/together.db")
+INACTIVITY_SECONDS = 180
+ACTIVE_DAYS = 7
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
+    level=logging.INFO
 )
-log = logging.getLogger(BOT_NAME)
+log = logging.getLogger("Together")
 
-PROFILE_STEPS = ("name", "age", "city", "gender", "looking_for", "about", "photo")
+# =========================================================
+# STATES
+# =========================================================
 
+NAME, AGE, CITY, GENDER, LOOKING_FOR, ABOUT, PHOTO = range(7)
 
-def now():
-    return datetime.now(timezone.utc).isoformat()
+# =========================================================
+# STORAGE / DB
+# =========================================================
 
+def ensure_storage():
+    folder = os.path.dirname(DB_FILE)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
 
 def db():
-    con = sqlite3.connect(DB_PATH, timeout=30)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys=ON")
-    con.execute("PRAGMA busy_timeout=30000")
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA synchronous=NORMAL")
-    return con
-
+    ensure_storage()
+    conn = sqlite3.connect(
+        DB_FILE,
+        timeout=30,
+        check_same_thread=False
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
 
 def init_db():
-    with db() as con:
-        con.executescript("""
+    with db() as conn:
+        conn.executescript("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY,
-            username TEXT DEFAULT '',
-            name TEXT NOT NULL,
-            age INTEGER NOT NULL,
-            city TEXT NOT NULL,
-            gender TEXT NOT NULL,
-            looking_for TEXT NOT NULL,
-            about TEXT DEFAULT '',
-            photo_file_id TEXT DEFAULT '',
+            username TEXT,
+            name TEXT,
+            age INTEGER,
+            city TEXT,
+            gender TEXT,
+            looking_for TEXT,
+            about TEXT,
+            photo_file_id TEXT,
             banned INTEGER DEFAULT 0,
             created_at TEXT NOT NULL,
             last_active TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS swipes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
             from_user INTEGER NOT NULL,
             to_user INTEGER NOT NULL,
             action TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            UNIQUE(from_user, to_user)
+            PRIMARY KEY (from_user, to_user)
         );
 
         CREATE TABLE IF NOT EXISTS matches (
@@ -108,18 +105,16 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS blocks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
             blocker INTEGER NOT NULL,
             blocked INTEGER NOT NULL,
             created_at TEXT NOT NULL,
-            UNIQUE(blocker, blocked)
+            PRIMARY KEY (blocker, blocked)
         );
 
         CREATE TABLE IF NOT EXISTS activity_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             action TEXT NOT NULL,
-            details TEXT DEFAULT '',
             created_at TEXT NOT NULL
         );
 
@@ -128,1054 +123,1127 @@ def init_db():
             value TEXT NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS chat_sessions (
-            user_id INTEGER PRIMARY KEY,
-            match_id INTEGER NOT NULL,
-            last_active TEXT NOT NULL
-        );
-
         INSERT OR IGNORE INTO bot_settings(key, value)
         VALUES ('activity_notifications', '1');
         """)
 
+# =========================================================
+# HELPERS
+# =========================================================
 
-def user_exists(uid):
-    with db() as con:
-        return con.execute("SELECT 1 FROM users WHERE id=?", (uid,)).fetchone() is not None
+def now():
+    return datetime.utcnow().isoformat(timespec="seconds")
 
+def user_exists(user_id):
+    with db() as conn:
+        return conn.execute(
+            "SELECT 1 FROM users WHERE id=?", (user_id,)
+        ).fetchone() is not None
 
-def get_user(uid):
-    with db() as con:
-        return con.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+def is_banned(user_id):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT banned FROM users WHERE id=?", (user_id,)
+        ).fetchone()
+        return bool(row and row["banned"])
 
+def ensure_user(tg_user):
+    t = now()
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO users(id, username, created_at, last_active)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                username=excluded.username,
+                last_active=excluded.last_active
+        """, (tg_user.id, tg_user.username or "", t, t))
 
-def touch(uid):
-    with db() as con:
-        con.execute("UPDATE users SET last_active=? WHERE id=?", (now(), uid))
-
-
-def log_activity(uid, action, details=""):
-    with db() as con:
-        con.execute(
-            "INSERT INTO activity_logs(user_id,action,details,created_at) VALUES(?,?,?,?)",
-            (uid, action, details, now()),
+def touch(user_id):
+    with db() as conn:
+        conn.execute(
+            "UPDATE users SET last_active=? WHERE id=?",
+            (now(), user_id)
         )
 
+def log_activity(user_id, action):
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO activity_logs(user_id, action, created_at) VALUES (?, ?, ?)",
+            (user_id, action, now())
+        )
+
+def get_user(user_id):
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM users WHERE id=?", (user_id,)
+        ).fetchone()
+
+def update_user(user_id, **fields):
+    if not fields:
+        return
+    fields["last_active"] = now()
+    allowed = {
+        "username", "name", "age", "city", "gender",
+        "looking_for", "about", "photo_file_id", "banned"
+    }
+    fields = {k: v for k, v in fields.items() if k in allowed}
+    if not fields:
+        return
+    sql = ", ".join(f"{k}=?" for k in fields)
+    values = list(fields.values()) + [user_id]
+    with db() as conn:
+        conn.execute(f"UPDATE users SET {sql} WHERE id=?", values)
+
+def profile_complete(user_id):
+    u = get_user(user_id)
+    if not u:
+        return False
+    return all([
+        u["name"], u["age"], u["city"], u["gender"],
+        u["looking_for"], u["about"], u["photo_file_id"]
+    ])
 
 def activity_notifications_enabled():
-    with db() as con:
-        row = con.execute(
+    with db() as conn:
+        row = conn.execute(
             "SELECT value FROM bot_settings WHERE key='activity_notifications'"
         ).fetchone()
-    return bool(row and row["value"] == "1")
+        return bool(row and row["value"] == "1")
 
+def set_activity_notifications(enabled):
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO bot_settings(key, value) VALUES ('activity_notifications', ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """, ("1" if enabled else "0",))
 
-async def admin_activity(app, uid, action, details=""):
-    log_activity(uid, action, details)
+async def notify_admin(context, text):
     if ADMIN_ID and activity_notifications_enabled():
         try:
-            await app.bot.send_message(
-                ADMIN_ID,
-                f"📊 <b>{BOT_NAME}</b>\n"
-                f"👤 ID: <code>{uid}</code>\n"
-                f"⚡ {html.escape(action)}"
-                + (f"\n📝 {html.escape(details)}" if details else ""),
-                parse_mode="HTML",
-            )
+            await context.bot.send_message(ADMIN_ID, text)
         except Exception:
             log.exception("Admin notification failed")
 
+# =========================================================
+# KEYBOARDS
+# =========================================================
 
-def main_keyboard(uid):
+def main_keyboard(user_id):
     rows = [
         ["👤 Իմ պրոֆիլը", "🔎 Գտնել մարդկանց"],
         ["❤️ Իմ Match-երը", "✏️ Խմբագրել պրոֆիլը"],
-        ["🗑️ Ջնջել պրոֆիլը"],
+        ["⚙️ Կարգավորումներ"]
     ]
-    if uid == ADMIN_ID:
+    if user_id == ADMIN_ID:
         rows.append(["🛡️ Admin մենյու"])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
+def cancel_keyboard():
+    return ReplyKeyboardMarkup(
+        [["⬅️ Չեղարկել"]],
+        resize_keyboard=True
+    )
 
-def start_keyboard():
-    return ReplyKeyboardMarkup([["🚀 Ստեղծել պրոֆիլ"]], resize_keyboard=True)
+def gender_keyboard():
+    return ReplyKeyboardMarkup(
+        [["👨 Տղամարդ"], ["👩 Կին"]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
 
+def looking_keyboard():
+    return ReplyKeyboardMarkup(
+        [["👨 Տղամարդ"], ["👩 Կին"]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+def report_keyboard(user_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚫 Անպատշաճ բովանդակություն", callback_data=f"report:{user_id}:inappropriate")],
+        [InlineKeyboardButton("👤 Կեղծ պրոֆիլ", callback_data=f"report:{user_id}:fake")],
+        [InlineKeyboardButton("⚠️ Վիրավորանք / չարաշահում", callback_data=f"report:{user_id}:abuse")],
+        [InlineKeyboardButton("📝 Այլ", callback_data=f"report:{user_id}:other")],
+        [InlineKeyboardButton("🚫 Արգելափակել", callback_data=f"block:{user_id}")]
+    ])
+
+def settings_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑️ Ջնջել իմ պրոֆիլը", callback_data="delete_profile")],
+        [InlineKeyboardButton("⬅️ Գլխավոր մենյու", callback_data="home")]
+    ])
+
+def admin_keyboard():
+    status = "🟢 Միացված" if activity_notifications_enabled() else "🔴 Անջատված"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Վիճակագրություն", callback_data="admin:stats")],
+        [InlineKeyboardButton("👥 Օգտատերեր", callback_data="admin:users")],
+        [InlineKeyboardButton("🚨 Հաղորդումներ", callback_data="admin:reports")],
+        [InlineKeyboardButton(f"🔔 Ակտիվության հաղորդագրություններ՝ {status}",
+                              callback_data="admin:activity_toggle")],
+        [InlineKeyboardButton("⬅️ Գլխավոր մենյու", callback_data="home")]
+    ])
+
+# =========================================================
+# START / HOME
+# =========================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    ensure_user(user)
+
+    if is_banned(user.id):
+        await update.message.reply_text("🚫 Ձեր պրոֆիլը արգելափակված է։")
+        return ConversationHandler.END
+
+    touch(user.id)
+    context.user_data.clear()
+    log_activity(user.id, "start")
+
+    if profile_complete(user.id):
+        await home(update, context)
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "❤️ Բարի գալուստ Together։\n\n"
+        "Այստեղ կարող եք ծանոթանալ նոր մարդկանց հետ։\n"
+        "Սկսելու համար լրացրեք ձեր պրոֆիլը։",
+        reply_markup=cancel_keyboard()
+    )
+    await update.message.reply_text("Ինչպե՞ս է ձեր անունը։")
+    context.user_data["step"] = "name"
+    return NAME
+
+async def home(update, context):
+    user_id = update.effective_user.id
+    touch(user_id)
+    context.user_data["mode"] = "home"
+    text = (
+        "❤️ <b>Together</b>\n\n"
+        "Ընտրեք գործողությունը՝"
+    )
+    if update.callback_query:
+        await update.callback_query.message.edit_text(text, parse_mode="HTML")
+        await update.callback_query.message.reply_text(
+            "Գլխավոր մենյու",
+            reply_markup=main_keyboard(user_id)
+        )
+    else:
+        await update.message.reply_text(
+            text, parse_mode="HTML",
+            reply_markup=main_keyboard(user_id)
+        )
+
+# =========================================================
+# PROFILE CREATION / EDIT
+# =========================================================
+
+async def start_profile(update, context):
+    context.user_data.clear()
+    context.user_data["step"] = "name"
+    await update.message.reply_text(
+        "✏️ Սկսենք պրոֆիլի լրացումը։\n\nԻնչպե՞ս է ձեր անունը։",
+        reply_markup=cancel_keyboard()
+    )
+    return NAME
+
+async def edit_profile(update, context):
+    context.user_data.clear()
+    context.user_data["editing"] = True
+    context.user_data["step"] = "name"
+    await update.message.reply_text(
+        "✏️ Փոխենք ձեր պրոֆիլը։\n\nԳրեք ձեր անունը։",
+        reply_markup=cancel_keyboard()
+    )
+    return NAME
+
+async def name_step(update, context):
+    if update.message.text == "⬅️ Չեղարկել":
+        await home(update, context)
+        return ConversationHandler.END
+
+    text = update.message.text.strip()
+    if len(text) < 2 or len(text) > 40:
+        await update.message.reply_text("❌ Անունը պետք է լինի 2–40 նիշ։")
+        return NAME
+
+    context.user_data["name"] = text
+    context.user_data["step"] = "age"
+    await update.message.reply_text("🎂 Քանի՞ տարեկան եք։", reply_markup=cancel_keyboard())
+    return AGE
+
+async def age_step(update, context):
+    if update.message.text == "⬅️ Չեղարկել":
+        await home(update, context)
+        return ConversationHandler.END
+
+    try:
+        age = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ Տարիքը գրեք թվով։ Օրինակ՝ 25")
+        return AGE
+
+    if not 18 <= age <= 99:
+        await update.message.reply_text("❌ Տարիքը պետք է լինի 18–99։")
+        return AGE
+
+    context.user_data["age"] = age
+    context.user_data["step"] = "city"
+    await update.message.reply_text("📍 Ո՞ր քաղաքում եք ապրում։", reply_markup=cancel_keyboard())
+    return CITY
+
+async def city_step(update, context):
+    if update.message.text == "⬅️ Չեղարկել":
+        await home(update, context)
+        return ConversationHandler.END
+
+    city = update.message.text.strip()
+    if len(city) < 2 or len(city) > 50:
+        await update.message.reply_text("❌ Գրեք քաղաքի ճիշտ անվանումը։")
+        return CITY
+
+    context.user_data["city"] = city
+    context.user_data["step"] = "gender"
+    await update.message.reply_text(
+        "⚧️ Ընտրեք ձեր սեռը։",
+        reply_markup=gender_keyboard()
+    )
+    return GENDER
+
+async def gender_step(update, context):
+    text = update.message.text.strip()
+    mapping = {"👨 Տղամարդ": "Տղամարդ", "👩 Կին": "Կին"}
+    if text not in mapping:
+        await update.message.reply_text("Խնդրում եմ ընտրեք տարբերակներից մեկը։", reply_markup=gender_keyboard())
+        return GENDER
+
+    context.user_data["gender"] = mapping[text]
+    context.user_data["step"] = "looking_for"
+    await update.message.reply_text(
+        "❤️ Ո՞ւմ հետ եք ցանկանում ծանոթանալ։",
+        reply_markup=looking_keyboard()
+    )
+    return LOOKING_FOR
+
+async def looking_step(update, context):
+    text = update.message.text.strip()
+    mapping = {"👨 Տղամարդ": "Տղամարդ", "👩 Կին": "Կին"}
+    if text not in mapping:
+        await update.message.reply_text("Խնդրում եմ ընտրեք տարբերակներից մեկը։", reply_markup=looking_keyboard())
+        return LOOKING_FOR
+
+    context.user_data["looking_for"] = mapping[text]
+    context.user_data["step"] = "about"
+    await update.message.reply_text(
+        "💬 Մի փոքր պատմեք ձեր մասին։\n\n"
+        "Օրինակ՝ հետաքրքրություններ, զբաղմունք, ինչ եք փնտրում։",
+        reply_markup=cancel_keyboard()
+    )
+    return ABOUT
+
+async def about_step(update, context):
+    if update.message.text == "⬅️ Չեղարկել":
+        await home(update, context)
+        return ConversationHandler.END
+
+    about = update.message.text.strip()
+    if len(about) < 5 or len(about) > 500:
+        await update.message.reply_text("❌ Գրեք 5–500 նիշի սահմաններում։")
+        return ABOUT
+
+    context.user_data["about"] = about
+    context.user_data["step"] = "photo"
+    await update.message.reply_text(
+        "📸 Ուղարկեք ձեր լուսանկարը։",
+        reply_markup=cancel_keyboard()
+    )
+    return PHOTO
+
+async def photo_step(update, context):
+    if update.message.text == "⬅️ Չեղարկել":
+        await home(update, context)
+        return ConversationHandler.END
+
+    if not update.message.photo:
+        await update.message.reply_text("❌ Խնդրում եմ ուղարկեք լուսանկար։")
+        return PHOTO
+
+    photo_id = update.message.photo[-1].file_id
+    user_id = update.effective_user.id
+
+    update_user(
+        user_id,
+        name=context.user_data["name"],
+        age=context.user_data["age"],
+        city=context.user_data["city"],
+        gender=context.user_data["gender"],
+        looking_for=context.user_data["looking_for"],
+        about=context.user_data["about"],
+        photo_file_id=photo_id
+    )
+
+    context.user_data.clear()
+    log_activity(user_id, "profile_saved")
+    await notify_admin(context, f"👤 Նոր/թարմացված պրոֆիլ՝ {user_id}")
+
+    await update.message.reply_text(
+        "✅ Ձեր պրոֆիլը պատրաստ է։\n\n"
+        "Այժմ կարող եք գտնել մարդկանց և ծանոթանալ։",
+        reply_markup=main_keyboard(user_id)
+    )
+    return ConversationHandler.END
+
+# =========================================================
+# PROFILE
+# =========================================================
 
 def profile_text(u):
     return (
-        f"👤 <b>{html.escape(u['name'])}</b>\n"
-        f"🎂 {u['age']}\n"
-        f"📍 {html.escape(u['city'])}\n"
-        f"⚧ {html.escape(u['gender'])}\n"
-        f"❤️ Փնտրում է՝ {html.escape(u['looking_for'])}\n"
-        f"📝 {html.escape(u['about'] or 'Չի նշվել')}"
+        f"👤 <b>{u['name']}</b>\n"
+        f"🎂 {u['age']} տարեկան\n"
+        f"📍 {u['city']}\n"
+        f"⚧️ {u['gender']}\n"
+        f"❤️ Փնտրում է՝ {u['looking_for']}\n\n"
+        f"💬 {u['about']}"
     )
 
+async def show_profile(update, context, user_id=None):
+    uid = user_id or update.effective_user.id
+    u = get_user(uid)
+    if not u:
+        return
 
-def profile_buttons(uid):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Խմբագրել", callback_data="edit_profile")],
-        [InlineKeyboardButton("🗑️ Ջնջել պրոֆիլը", callback_data="delete_profile")],
-    ])
+    text = profile_text(u)
 
-
-def discovery_buttons(target):
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("❤️ Հավանել", callback_data=f"like:{target}"),
-            InlineKeyboardButton("❌ Անցնել", callback_data=f"pass:{target}"),
-        ],
-        [
-            InlineKeyboardButton("⭐ Super Like", callback_data=f"super:{target}"),
-            InlineKeyboardButton("🚫 Արգելափակել", callback_data=f"block:{target}"),
-        ],
-        [InlineKeyboardButton("⚠️ Բողոքել", callback_data=f"report:{target}")],
-    ])
-
-
-def match_buttons(match_id, other):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💬 Բացել չատը", callback_data=f"chat:{match_id}")],
-        [InlineKeyboardButton("🚫 Արգելափակել", callback_data=f"block:{other}")],
-        [InlineKeyboardButton("⚠️ Բողոքել", callback_data=f"report:{other}")],
-    ])
-
-
-def parse_age(text):
-    try:
-        age = int(text.strip())
-        return age if 18 <= age <= 100 else None
-    except ValueError:
-        return None
-
-
-async def send_profile_prompt(update, context, editing=False):
-    context.user_data["profile_step"] = "name"
-    context.user_data["editing"] = editing
-    await update.effective_message.reply_text(
-        "✏️ Սկսենք պրոֆիլից։\n\nԻնչպե՞ս է քո անունը։",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
-
-async def handle_profile_step(update, context):
-    uid = update.effective_user.id
-    step = context.user_data.get("profile_step")
-    if not step:
-        return False
-
-    text = (update.effective_message.text or "").strip()
-    data = context.user_data.setdefault("profile", {})
-
-    if step == "name":
-        if len(text) < 2 or len(text) > 40:
-            await update.effective_message.reply_text("❗ Գրիր անունը՝ 2-40 նիշ։")
-            return True
-        data["name"] = text
-        context.user_data["profile_step"] = "age"
-        await update.effective_message.reply_text("🎂 Քանի՞ տարեկան ես։")
-        return True
-
-    if step == "age":
-        age = parse_age(text)
-        if not age:
-            await update.effective_message.reply_text("❗ Տարիքը պետք է լինի 18-100։")
-            return True
-        data["age"] = age
-        context.user_data["profile_step"] = "city"
-        await update.effective_message.reply_text("📍 Ո՞ր քաղաքում ես։")
-        return True
-
-    if step == "city":
-        if len(text) < 2:
-            await update.effective_message.reply_text("❗ Գրիր քաղաքը։")
-            return True
-        data["city"] = text[:60]
-        context.user_data["profile_step"] = "gender"
-        await update.effective_message.reply_text(
-            "⚧ Ընտրիր սեռը՝\n\n"
-            "👨 Տղամարդ\n"
-            "👩 Կին"
-        )
-        return True
-
-    if step == "gender":
-        if text not in ("👨 Տղամարդ", "👩 Կին"):
-            await update.effective_message.reply_text("Ընտրիր՝ 👨 Տղամարդ կամ 👩 Կին։")
-            return True
-        data["gender"] = "Տղամարդ" if "Տղամարդ" in text else "Կին"
-        context.user_data["profile_step"] = "looking_for"
-        await update.effective_message.reply_text(
-            "❤️ Ո՞ւմ ես ցանկանում գտնել՝\n\n"
-            "👨 Տղամարդկանց\n"
-            "👩 Կանանց\n"
-            "👨‍👩‍👧 Բոլորին"
-        )
-        return True
-
-    if step == "looking_for":
-        if text not in ("👨 Տղամարդկանց", "👩 Կանանց", "👨‍👩‍👧 Բոլորին"):
-            await update.effective_message.reply_text(
-                "Ընտրիր՝ 👨 Տղամարդկանց, 👩 Կանանց կամ 👨‍👩‍👧 Բոլորին։"
+    if update.callback_query:
+        q = update.callback_query
+        await q.answer()
+        if u["photo_file_id"]:
+            await q.message.reply_photo(
+                u["photo_file_id"],
+                caption=text,
+                parse_mode="HTML"
             )
-            return True
-        data["looking_for"] = (
-            "Տղամարդ" if text == "👨 Տղամարդկանց"
-            else "Կին" if text == "👩 Կանանց"
-            else "Բոլորին"
-        )
-        context.user_data["profile_step"] = "about"
-        await update.effective_message.reply_text(
-            "📝 Մի փոքր պատմիր քո մասին։\n"
-            "Կարող ես գրել մինչև 500 նիշ։"
-        )
-        return True
-
-    if step == "about":
-        data["about"] = text[:500]
-        context.user_data["profile_step"] = "photo"
-        await update.effective_message.reply_text("📸 Ուղարկիր քո լուսանկարը։")
-        return True
-
-    return False
-
-
-async def handle_photo(update, context):
-    if context.user_data.get("profile_step") != "photo":
-        return False
-
-    uid = update.effective_user.id
-    data = context.user_data.setdefault("profile", {})
-    data["photo_file_id"] = update.effective_message.photo[-1].file_id
-
-    with db() as con:
-        old = con.execute("SELECT 1 FROM users WHERE id=?", (uid,)).fetchone()
-        if old:
-            con.execute("""
-                UPDATE users
-                SET username=?, name=?, age=?, city=?, gender=?, looking_for=?,
-                    about=?, photo_file_id=?, last_active=?
-                WHERE id=?
-            """, (
-                update.effective_user.username or "",
-                data["name"], data["age"], data["city"], data["gender"],
-                data["looking_for"], data["about"], data["photo_file_id"], now(), uid
-            ))
         else:
-            con.execute("""
-                INSERT INTO users
-                (id,username,name,age,city,gender,looking_for,about,photo_file_id,created_at,last_active)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                uid, update.effective_user.username or "", data["name"], data["age"],
-                data["city"], data["gender"], data["looking_for"], data["about"],
-                data["photo_file_id"], now(), now()
-            ))
+            await q.message.reply_text(text, parse_mode="HTML")
+    else:
+        if u["photo_file_id"]:
+            await update.message.reply_photo(
+                u["photo_file_id"],
+                caption=text,
+                parse_mode="HTML"
+            )
+        else:
+            await update.message.reply_text(text, parse_mode="HTML")
 
-    context.user_data.clear()
-    await update.effective_message.reply_text(
-        "🎉 <b>Պրոֆիլը պատրաստ է։</b>\n\nԲարի գալուստ Together ❤️",
-        parse_mode="HTML",
-        reply_markup=main_keyboard(uid),
+# =========================================================
+# DISCOVERY
+# =========================================================
+
+def compatible(a, b):
+    return (
+        a["looking_for"] == b["gender"]
+        and b["looking_for"] == a["gender"]
     )
-    await admin_activity(context.application, uid, "Պրոֆիլը ստեղծվեց/թարմացվեց")
-    return True
 
-
-def compatible(me, other):
-    if me["looking_for"] != "Բոլորին" and me["looking_for"] != other["gender"]:
-        return False
-    if other["looking_for"] != "Բոլորին" and other["looking_for"] != me["gender"]:
-        return False
-    return True
-
-
-def blocked_either(a, b):
-    with db() as con:
-        return con.execute("""
+def blocked_between(a, b):
+    with db() as conn:
+        return conn.execute("""
             SELECT 1 FROM blocks
-            WHERE (blocker=? AND blocked=?) OR (blocker=? AND blocked=?)
+            WHERE (blocker=? AND blocked=?)
+               OR (blocker=? AND blocked=?)
         """, (a, b, b, a)).fetchone() is not None
 
+def next_candidate(user_id):
+    me = get_user(user_id)
+    cutoff = (datetime.utcnow() - timedelta(days=ACTIVE_DAYS)).isoformat(timespec="seconds")
 
-def already_swiped(a, b):
-    with db() as con:
-        return con.execute(
-            "SELECT 1 FROM swipes WHERE from_user=? AND to_user=?",
-            (a, b)
-        ).fetchone() is not None
-
-
-def find_candidate(uid):
-    me = get_user(uid)
-    if not me:
-        return None
-
-    with db() as con:
-        rows = con.execute("""
+    with db() as conn:
+        rows = conn.execute("""
             SELECT * FROM users
-            WHERE id != ? AND banned=0
+            WHERE id != ?
+              AND banned = 0
+              AND last_active >= ?
+              AND name IS NOT NULL
+              AND age IS NOT NULL
+              AND city IS NOT NULL
+              AND gender IS NOT NULL
+              AND looking_for IS NOT NULL
+              AND about IS NOT NULL
+              AND photo_file_id IS NOT NULL
               AND id NOT IN (
-                SELECT to_user FROM swipes WHERE from_user=?
+                  SELECT to_user FROM swipes WHERE from_user=?
               )
-              AND id NOT IN (
-                SELECT blocked FROM blocks WHERE blocker=?
-              )
-              AND id NOT IN (
-                SELECT blocker FROM blocks WHERE blocked=?
-              )
-            ORDER BY last_active DESC
-            LIMIT 100
-        """, (uid, uid, uid, uid)).fetchall()
+            ORDER BY RANDOM()
+            LIMIT 50
+        """, (user_id, cutoff, user_id)).fetchall()
 
-    candidates = [u for u in rows if compatible(me, u)]
-    if not candidates:
-        return None
+    for candidate in rows:
+        if compatible(me, candidate) and not blocked_between(user_id, candidate["id"]):
+            return candidate
+    return None
 
-    def score(u):
-        city = 30 if u["city"].lower() == me["city"].lower() else 0
-        age = max(0, 20 - abs(u["age"] - me["age"]))
-        try:
-            activity = max(0, 10 - int(
-                (datetime.now(timezone.utc) -
-                 datetime.fromisoformat(u["last_active"])).total_seconds() / 86400
-            ))
-        except Exception:
-            activity = 0
-        return city + age + activity
+async def discover(update, context):
+    user_id = update.effective_user.id
 
-    return max(candidates, key=score)
-
-
-async def show_candidate(update, uid):
-    candidate = find_candidate(uid)
-    if not candidate:
-        await update.effective_message.reply_text(
-            "🔎 Այս պահին համապատասխան նոր պրոֆիլ չկա։\nՓորձիր մի փոքր ուշ։",
-            reply_markup=main_keyboard(uid),
+    if not profile_complete(user_id):
+        await update.message.reply_text(
+            "❗ Նախ լրացրեք ձեր պրոֆիլը։",
+            reply_markup=main_keyboard(user_id)
         )
         return
 
-    text = (
-        f"❤️ <b>{html.escape(candidate['name'])}</b>, {candidate['age']}\n"
-        f"📍 {html.escape(candidate['city'])}\n\n"
-        f"{html.escape(candidate['about'] or '')}"
-    )
+    candidate = next_candidate(user_id)
+    if not candidate:
+        await update.message.reply_text(
+            "🔎 Այս պահին համապատասխան նոր պրոֆիլ չգտնվեց։\n\n"
+            "Փորձեք մի փոքր ուշ։"
+        )
+        return
+
+    context.user_data["candidate_id"] = candidate["id"]
+    context.user_data["mode"] = "discover"
+    touch(user_id)
+
+    text = profile_text(candidate)
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("❤️ Հավանել", callback_data=f"like:{candidate['id']}"),
+            InlineKeyboardButton("🔥 Super Like", callback_data=f"super:{candidate['id']}")
+        ],
+        [
+            InlineKeyboardButton("👎 Հաջորդը", callback_data=f"pass:{candidate['id']}")
+        ],
+        [
+            InlineKeyboardButton("🚨 Հաղորդել", callback_data=f"report_menu:{candidate['id']}"),
+            InlineKeyboardButton("🚫 Արգելափակել", callback_data=f"block:{candidate['id']}")
+        ]
+    ])
+
     if candidate["photo_file_id"]:
-        await update.effective_message.reply_photo(
+        await update.message.reply_photo(
             candidate["photo_file_id"],
             caption=text,
             parse_mode="HTML",
-            reply_markup=discovery_buttons(candidate["id"]),
+            reply_markup=keyboard
         )
     else:
-        await update.effective_message.reply_text(
-            text, parse_mode="HTML", reply_markup=discovery_buttons(candidate["id"])
-        )
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
+async def swipe(update, context):
+    q = update.callback_query
+    await q.answer()
+    user_id = q.from_user.id
+    action, target_id = q.data.split(":")
+    target_id = int(target_id)
 
-async def process_swipe(update, context, action, target):
-    uid = update.effective_user.id
-    if uid == target or not user_exists(target) or blocked_either(uid, target):
-        await update.callback_query.answer("Այս պրոֆիլը հասանելի չէ։", show_alert=True)
-        return
+    if action == "pass":
+        action_db = "pass"
+    elif action == "like":
+        action_db = "like"
+    else:
+        action_db = "super"
 
-    with db() as con:
-        con.execute("""
-            INSERT OR REPLACE INTO swipes(from_user,to_user,action,created_at)
-            VALUES(?,?,?,?)
-        """, (uid, target, action, now()))
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO swipes(from_user, to_user, action, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(from_user, to_user) DO UPDATE SET
+                action=excluded.action,
+                created_at=excluded.created_at
+        """, (user_id, target_id, action_db, now()))
 
-        mutual = con.execute("""
-            SELECT action FROM swipes
-            WHERE from_user=? AND to_user=?
-        """, (target, uid)).fetchone()
+    log_activity(user_id, action_db)
 
-        is_match = action in ("like", "super") and mutual and mutual["action"] in ("like", "super")
-        match_id = None
-        if is_match:
-            a, b = sorted((uid, target))
-            con.execute(
-                "INSERT OR IGNORE INTO matches(user1,user2,created_at) VALUES(?,?,?)",
-                (a, b, now())
+    if action_db in ("like", "super"):
+        with db() as conn:
+            mutual = conn.execute("""
+                SELECT action FROM swipes
+                WHERE from_user=? AND to_user=?
+                  AND action IN ('like', 'super')
+            """, (target_id, user_id)).fetchone()
+
+        if mutual:
+            u1, u2 = sorted([user_id, target_id])
+            with db() as conn:
+                conn.execute("""
+                    INSERT OR IGNORE INTO matches(user1, user2, created_at)
+                    VALUES (?, ?, ?)
+                """, (u1, u2, now()))
+                match = conn.execute(
+                    "SELECT id FROM matches WHERE user1=? AND user2=?",
+                    (u1, u2)
+                ).fetchone()
+
+            await q.message.edit_text(
+                "🎉 <b>Match!</b>\n\n"
+                "Դուք երկուսդ էլ հավանել եք միմյանց։ ❤️",
+                parse_mode="HTML"
             )
-            row = con.execute(
-                "SELECT id FROM matches WHERE user1=? AND user2=?", (a, b)
-            ).fetchone()
-            match_id = row["id"]
+            await q.message.reply_text(
+                "💬 Կարող եք սկսել զրույցը։",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💬 Բացել չատը", callback_data=f"chat:{match['id']}")],
+                    [InlineKeyboardButton("🔎 Գտնել հաջորդին", callback_data="discover_next")]
+                ])
+            )
 
-    if is_match:
+            try:
+                await context.bot.send_message(
+                    target_id,
+                    "🎉 Դուք նոր Match ունեք։ ❤️\n"
+                    "Բացեք Together-ը՝ զրույցը սկսելու համար։"
+                )
+            except Exception:
+                pass
+            return
+
         try:
             await context.bot.send_message(
-                target,
-                "🎉 <b>Նոր Match Together-ում!</b>\n\n"
-                "Դուք երկուսդ էլ հավանել եք միմյանց ❤️",
-                parse_mode="HTML",
-                reply_markup=main_keyboard(target),
+                target_id,
+                "❤️ Ինչ-որ մեկը հավանել է ձեր պրոֆիլը։\n"
+                "Եթե փոխադարձ լինի, կունենաք Match։"
             )
         except Exception:
             pass
 
-        await update.callback_query.message.reply_text(
-            "🎉 <b>Match!</b>\n\nԴուք հավանել եք միմյանց ❤️",
-            parse_mode="HTML",
-            reply_markup=match_buttons(match_id, target),
-        )
-    else:
-        await update.callback_query.message.reply_text(
-            "❤️ Հաջողվեց։ Շարունակե՞նք։",
-            reply_markup=main_keyboard(uid),
-        )
+    await q.message.edit_text(
+        "✅ Պահպանվեց։\n\nՍեղմեք «Հաջորդը»՝ նոր պրոֆիլ տեսնելու համար։"
+    )
+    await q.message.reply_text(
+        "🔎 Շարունակե՞նք։",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➡️ Հաջորդը", callback_data="discover_next")],
+            [InlineKeyboardButton("🏠 Գլխավոր մենյու", callback_data="home")]
+        ])
+    )
 
-    await update.callback_query.answer()
-    await admin_activity(context.application, uid, action, f"target={target}")
+# =========================================================
+# MATCHES / CHAT
+# =========================================================
 
-
-def get_matches(uid):
-    with db() as con:
-        return con.execute("""
-            SELECT m.id,
+def get_matches(user_id):
+    with db() as conn:
+        return conn.execute("""
+            SELECT m.*,
                    CASE WHEN m.user1=? THEN m.user2 ELSE m.user1 END AS other_id
             FROM matches m
             WHERE m.user1=? OR m.user2=?
             ORDER BY m.created_at DESC
-        """, (uid, uid, uid)).fetchall()
+        """, (user_id, user_id, user_id)).fetchall()
 
-
-def get_match(uid, match_id):
-    with db() as con:
-        return con.execute("""
+def find_match(match_id, user_id):
+    with db() as conn:
+        return conn.execute("""
             SELECT * FROM matches
             WHERE id=? AND (user1=? OR user2=?)
-        """, (match_id, uid, uid)).fetchone()
+        """, (match_id, user_id, user_id)).fetchone()
 
+async def show_matches(update, context):
+    user_id = update.effective_user.id
+    matches = get_matches(user_id)
 
-def set_chat(uid, match_id):
-    with db() as con:
-        con.execute("""
-            INSERT INTO chat_sessions(user_id,match_id,last_active)
-            VALUES(?,?,?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                match_id=excluded.match_id,
-                last_active=excluded.last_active
-        """, (uid, match_id, now()))
-
-
-def clear_chat(uid):
-    with db() as con:
-        con.execute("DELETE FROM chat_sessions WHERE user_id=?", (uid,))
-
-
-def chat_session(uid):
-    with db() as con:
-        return con.execute(
-            "SELECT * FROM chat_sessions WHERE user_id=?", (uid,)
-        ).fetchone()
-
-
-async def open_chat(update, uid, match_id):
-    match = get_match(uid, match_id)
-    if not match:
-        await update.effective_message.reply_text("❗ Match-ը չի գտնվել։")
+    if not matches:
+        await update.message.reply_text(
+            "❤️ Դեռ Match չունեք։\n\nԳնացեք «🔎 Գտնել մարդկանց» բաժին։"
+        )
         return
 
-    other = match["user2"] if match["user1"] == uid else match["user1"]
-    if blocked_either(uid, other):
-        await update.effective_message.reply_text("🚫 Չատը հասանելի չէ։")
-        return
+    buttons = []
+    for m in matches:
+        other = get_user(m["other_id"])
+        if other:
+            buttons.append([
+                InlineKeyboardButton(
+                    f"💬 {other['name']}",
+                    callback_data=f"chat:{m['id']}"
+                )
+            ])
 
-    set_chat(uid, match_id)
-    await update.effective_message.reply_text(
-        "💬 <b>Չատը բացված է</b>\n\n"
-        "Գրիր հաղորդագրություն։\n"
-        "⏱️ 3 րոպե անգործությունից չատը ավտոմատ կփակվի։\n\n"
-        "❌ Փակել չատը՝ /cancel",
+    await update.message.reply_text(
+        "❤️ <b>Ձեր Match-երը</b>\n\nԸնտրեք զրույցը։",
         parse_mode="HTML",
-        reply_markup=ReplyKeyboardMarkup([["❌ Փակել չատը"]], resize_keyboard=True),
+        reply_markup=InlineKeyboardMarkup(buttons)
     )
 
+async def open_chat(update, context):
+    q = update.callback_query
+    await q.answer()
+    match_id = int(q.data.split(":")[1])
+    user_id = q.from_user.id
 
-async def forward_chat_message(update, uid, text, context):
-    session = chat_session(uid)
-    if not session:
-        return False
-
-    match = get_match(uid, session["match_id"])
+    match = find_match(match_id, user_id)
     if not match:
-        clear_chat(uid)
+        await q.message.reply_text("❌ Զրույցը հասանելի չէ։")
+        return
+
+    other_id = match["user2"] if match["user1"] == user_id else match["user1"]
+    other = get_user(other_id)
+    context.user_data["chat_match_id"] = match_id
+    context.user_data["chat_other_id"] = other_id
+    context.user_data["mode"] = "chat"
+    context.user_data["last_chat_activity"] = datetime.utcnow().timestamp()
+
+    await q.message.reply_text(
+        f"💬 Դուք զրուցում եք <b>{other['name']}</b>-ի հետ։\n\n"
+        "Գրեք հաղորդագրություն։\n"
+        "Չատը 3 րոպե անգործությունից ավտոմատ կփակվի։",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚫 Արգելափակել", callback_data=f"block:{other_id}")],
+            [InlineKeyboardButton("🚨 Հաղորդել", callback_data=f"report_menu:{other_id}")],
+            [InlineKeyboardButton("🏠 Գլխավոր մենյու", callback_data="home")]
+        ])
+    )
+
+async def send_chat_message(update, context):
+    user_id = update.effective_user.id
+    match_id = context.user_data.get("chat_match_id")
+    other_id = context.user_data.get("chat_other_id")
+
+    if not match_id or not other_id:
         return False
 
-    other = match["user2"] if match["user1"] == uid else match["user1"]
-    if blocked_either(uid, other):
-        clear_chat(uid)
-        await update.effective_message.reply_text(
-            "🚫 Չատը փակվել է։", reply_markup=main_keyboard(uid)
-        )
+    if blocked_between(user_id, other_id):
+        await update.message.reply_text("🚫 Զրույցը հասանելի չէ։")
+        context.user_data.clear()
         return True
 
-    with db() as con:
-        con.execute(
-            "INSERT INTO messages(match_id,sender_id,text,created_at) VALUES(?,?,?,?)",
-            (session["match_id"], uid, text[:4000], now()),
-        )
-        con.execute(
-            "UPDATE chat_sessions SET last_active=? WHERE user_id=?",
-            (now(), uid),
-        )
+    text = update.message.text.strip()
+    if not text:
+        return True
+
+    context.user_data["last_chat_activity"] = datetime.utcnow().timestamp()
+
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO messages(match_id, sender_id, text, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (match_id, user_id, text[:2000], now()))
 
     try:
         await context.bot.send_message(
-            other,
-            f"💬 <b>Նոր հաղորդագրություն Together-ում</b>\n\n"
-            f"{html.escape(text[:4000])}",
-            parse_mode="HTML",
-            reply_markup=main_keyboard(other),
+            other_id,
+            f"💬 Նոր հաղորդագրություն՝\n\n{text[:2000]}"
         )
     except Exception:
         pass
+
+    await update.message.reply_text("✅ Ուղարկվեց։")
     return True
 
-
-async def delete_profile(update, uid):
-    with db() as con:
-        match_rows = con.execute("""
-            SELECT id FROM matches WHERE user1=? OR user2=?
-        """, (uid, uid)).fetchall()
-        match_ids = [r["id"] for r in match_rows]
-
-        for mid in match_ids:
-            con.execute("DELETE FROM messages WHERE match_id=?", (mid,))
-
-        con.execute("DELETE FROM chat_sessions WHERE user_id=?", (uid,))
-        con.execute("DELETE FROM swipes WHERE from_user=? OR to_user=?", (uid, uid))
-        con.execute("DELETE FROM matches WHERE user1=? OR user2=?", (uid, uid))
-        con.execute("DELETE FROM reports WHERE reporter=? OR reported=?", (uid, uid))
-        con.execute("DELETE FROM blocks WHERE blocker=? OR blocked=?", (uid, uid))
-        con.execute("DELETE FROM activity_logs WHERE user_id=?", (uid,))
-        con.execute("DELETE FROM users WHERE id=?", (uid,))
-
-
-async def profile_delete_confirm(update, context):
-    await update.effective_message.reply_text(
-        "⚠️ <b>Ջնջե՞լ պրոֆիլը</b>\n\n"
-        "Բոլոր տվյալները, Match-երը, Like-երը և չատերի տվյալները կջնջվեն։\n"
-        "Այս գործողությունը հնարավոր չէ հետարկել։",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗑️ Այո, ջնջել", callback_data="delete_yes")],
-            [InlineKeyboardButton("❌ Չեղարկել", callback_data="profile")],
-        ]),
-    )
-
-
-async def show_matches(update, uid):
-    matches = get_matches(uid)
-    if not matches:
-        await update.effective_message.reply_text(
-            "❤️ Դեռ Match չունես։",
-            reply_markup=main_keyboard(uid),
-        )
-        return
-
-    await update.effective_message.reply_text("❤️ <b>Իմ Match-երը</b>", parse_mode="HTML")
-    for m in matches:
-        other = get_user(m["other_id"])
-        if not other:
+async def inactivity_cleanup(context):
+    # Auto-closes chat/workflow state after 3 minutes.
+    for chat_id, data in list(context.application.user_data.items()):
+        last = data.get("last_chat_activity")
+        if not last:
             continue
-        await update.effective_message.reply_text(
-            f"❤️ <b>{html.escape(other['name'])}</b>, {other['age']}\n"
-            f"📍 {html.escape(other['city'])}",
-            parse_mode="HTML",
-            reply_markup=match_buttons(m["id"], other["id"]),
-        )
+        if datetime.utcnow().timestamp() - last >= INACTIVITY_SECONDS:
+            data.clear()
+            try:
+                await context.bot.send_message(
+                    chat_id,
+                    "⏱️ Չատը փակվեց 3 րոպե անգործությունից։\n\n"
+                    "Ձեր Match-երը պահպանվել են։",
+                    reply_markup=main_keyboard(chat_id)
+                )
+            except Exception:
+                pass
 
+# =========================================================
+# REPORT / BLOCK
+# =========================================================
 
-async def report_menu(update, target):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚫 Անպատշաճ բովանդակություն", callback_data=f"report_reason:{target}:Անպատշաճ բովանդակություն")],
-        [InlineKeyboardButton("🤖 Կեղծ պրոֆիլ", callback_data=f"report_reason:{target}:Կեղծ պրոֆիլ")],
-        [InlineKeyboardButton("⚠️ Այլ", callback_data=f"report_reason:{target}:Այլ")],
-    ])
-
-
-async def admin_menu(update):
-    enabled = activity_notifications_enabled()
-    toggle = (
-        "🔕 Անջատել ակտիվության հաղորդագրությունները"
-        if enabled else "🔔 Միացնել ակտիվության հաղորդագրությունները"
-    )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Վիճակագրություն", callback_data="admin_stats")],
-        [InlineKeyboardButton("👥 Վերջին օգտատերեր", callback_data="admin_users")],
-        [InlineKeyboardButton("⚠️ Բողոքներ", callback_data="admin_reports")],
-        [InlineKeyboardButton(toggle, callback_data="admin_toggle_activity")],
-        [InlineKeyboardButton("💾 Backup", callback_data="admin_backup")],
-    ])
-    await update.effective_message.reply_text(
-        f"🛡️ <b>{BOT_NAME} Admin</b>",
-        parse_mode="HTML",
-        reply_markup=kb,
-    )
-
-
-async def admin_stats(update):
-    with db() as con:
-        users = con.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
-        matches = con.execute("SELECT COUNT(*) c FROM matches").fetchone()["c"]
-        reports = con.execute(
-            "SELECT COUNT(*) c FROM reports WHERE status='new'"
-        ).fetchone()["c"]
-        active = con.execute("""
-            SELECT COUNT(*) c FROM users
-            WHERE last_active >= datetime('now','-1 day')
-        """).fetchone()["c"]
-    await update.callback_query.message.reply_text(
-        f"📊 <b>{BOT_NAME}</b>\n\n"
-        f"👥 Օգտատերեր՝ {users}\n"
-        f"🟢 Ակտիվ 24ժ՝ {active}\n"
-        f"❤️ Match-եր՝ {matches}\n"
-        f"⚠️ Նոր բողոքներ՝ {reports}",
-        parse_mode="HTML",
-    )
-
-
-async def admin_users(update):
-    with db() as con:
-        rows = con.execute("""
-            SELECT id,name,age,city,last_active
-            FROM users ORDER BY created_at DESC LIMIT 20
-        """).fetchall()
-    if not rows:
-        await update.callback_query.message.reply_text("Օգտատերեր չկան։")
-        return
-    text = "👥 <b>Վերջին օգտատերերը</b>\n\n"
-    for u in rows:
-        text += (
-            f"• {html.escape(u['name'])}, {u['age']} — "
-            f"{html.escape(u['city'])} — <code>{u['id']}</code>\n"
-        )
-    await update.callback_query.message.reply_text(text, parse_mode="HTML")
-
-
-async def admin_reports(update):
-    with db() as con:
-        rows = con.execute("""
-            SELECT * FROM reports
-            WHERE status='new' ORDER BY created_at DESC LIMIT 30
-        """).fetchall()
-    if not rows:
-        await update.callback_query.message.reply_text("⚠️ Նոր բողոքներ չկան։")
-        return
-    text = "⚠️ <b>Բողոքներ</b>\n\n"
-    for r in rows:
-        text += (
-            f"#{r['id']} | reporter=<code>{r['reporter']}</code> | "
-            f"reported=<code>{r['reported']}</code>\n"
-            f"Պատճառ՝ {html.escape(r['reason'])}\n\n"
-        )
-    await update.callback_query.message.reply_text(text, parse_mode="HTML")
-
-
-async def admin_backup(update):
-    filename = os.path.join(
-        BACKUP_DIR,
-        f"together_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-    )
-    src = db()
-    try:
-        dest = sqlite3.connect(filename)
-        with dest:
-            src.backup(dest)
-        dest.close()
-    finally:
-        src.close()
-    await update.callback_query.message.reply_text(
-        f"💾 Backup ստեղծվեց։\n<code>{html.escape(filename)}</code>",
-        parse_mode="HTML",
-    )
-
-
-async def inactivity_cleanup_loop(app):
-    while True:
-        try:
-            cutoff = datetime.now(timezone.utc).timestamp() - INACTIVITY_SECONDS
-            expired = []
-            with db() as con:
-                rows = con.execute("SELECT * FROM chat_sessions").fetchall()
-                for row in rows:
-                    try:
-                        ts = datetime.fromisoformat(row["last_active"]).timestamp()
-                    except Exception:
-                        ts = 0
-                    if ts < cutoff:
-                        expired.append(row["user_id"])
-                for uid in expired:
-                    con.execute("DELETE FROM chat_sessions WHERE user_id=?", (uid,))
-
-            for uid in expired:
-                try:
-                    await app.bot.send_message(
-                        uid,
-                        "⏱️ <b>Չատը ավտոմատ փակվեց</b>\n\n"
-                        "3 րոպե անգործության պատճառով։",
-                        parse_mode="HTML",
-                        reply_markup=main_keyboard(uid),
-                    )
-                except Exception:
-                    pass
-        except Exception:
-            log.exception("Cleanup error")
-        await asyncio.sleep(30)
-
-
-async def start(update, context):
-    uid = update.effective_user.id
-    context.user_data.clear()
-
-    u = get_user(uid)
-    if u:
-        touch(uid)
-        await update.effective_message.reply_text(
-            f"Բարի վերադարձ <b>{html.escape(u['name'])}</b> ❤️\n\n"
-            f"Դու Together-ում ես։",
-            parse_mode="HTML",
-            reply_markup=main_keyboard(uid),
-        )
-        return
-
-    await update.effective_message.reply_text(
-        f"❤️ <b>Բարի գալուստ {BOT_NAME}</b>\n\n"
-        "Ծանոթացիր նոր մարդկանց, գտիր փոխադարձ համակրանք և սկսիր շփվել։",
-        parse_mode="HTML",
-        reply_markup=start_keyboard(),
-    )
-
-
-async def help_cmd(update, context):
-    await update.effective_message.reply_text(
-        f"❤️ <b>{BOT_NAME}</b>\n\n"
-        "🔎 Գտնել մարդկանց — նոր պրոֆիլներ\n"
-        "❤️ Իմ Match-երը — փոխադարձ հավանումներ\n"
-        "✏️ Խմբագրել պրոֆիլը — փոխել տվյալները\n"
-        "🗑️ Ջնջել պրոֆիլը — ամբողջական ջնջում\n"
-        "❌ /cancel — չեղարկել ընթացիկ գործողությունը",
-        parse_mode="HTML",
-        reply_markup=main_keyboard(update.effective_user.id)
-        if user_exists(update.effective_user.id) else start_keyboard(),
-    )
-
-
-async def cancel(update, context):
-    uid = update.effective_user.id
-    clear_chat(uid)
-    context.user_data.clear()
-    if user_exists(uid):
-        await update.effective_message.reply_text(
-            "❌ Գործողությունը չեղարկվեց։",
-            reply_markup=main_keyboard(uid),
-        )
-    else:
-        await update.effective_message.reply_text(
-            "❌ Չեղարկվեց։",
-            reply_markup=start_keyboard(),
-        )
-
-
-async def callback(update, context):
+async def report_menu(update, context):
     q = update.callback_query
     await q.answer()
-    uid = q.from_user.id
-    touch(uid)
+    target = int(q.data.split(":")[1])
+    await q.message.reply_text(
+        "🚨 Ընտրեք հաղորդման պատճառը։",
+        reply_markup=report_keyboard(target)
+    )
 
-    data = q.data
+async def report_user(update, context):
+    q = update.callback_query
+    await q.answer("Հաղորդումը ստացվեց։")
+    _, target_id, reason = q.data.split(":")
+    target_id = int(target_id)
 
-    if data == "profile":
-        u = get_user(uid)
-        if not u:
-            await q.message.reply_text("Պրոֆիլ դեռ չունես։", reply_markup=start_keyboard())
-            return
-        text = profile_text(u)
-        if u["photo_file_id"]:
-            await q.message.reply_photo(
-                u["photo_file_id"], caption=text, parse_mode="HTML",
-                reply_markup=profile_buttons(uid)
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO reports(reporter, reported, reason, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (q.from_user.id, target_id, reason, now()))
+
+    log_activity(q.from_user.id, "report")
+    await notify_admin(
+        context,
+        f"🚨 Նոր հաղորդում\n"
+        f"Reporter: {q.from_user.id}\n"
+        f"Reported: {target_id}\n"
+        f"Պատճառ: {reason}"
+    )
+    await q.message.reply_text("✅ Հաղորդումը ուղարկվեց ադմինին։")
+
+async def block_user(update, context):
+    q = update.callback_query
+    await q.answer("Օգտատերը արգելափակվեց։")
+    target = int(q.data.split(":")[1])
+    user_id = q.from_user.id
+
+    if target == user_id:
+        return
+
+    with db() as conn:
+        conn.execute("""
+            INSERT OR IGNORE INTO blocks(blocker, blocked, created_at)
+            VALUES (?, ?, ?)
+        """, (user_id, target, now()))
+
+    context.user_data.clear()
+    log_activity(user_id, "block")
+
+    await q.message.reply_text(
+        "🚫 Օգտատերը արգելափակվեց։\n"
+        "Նրա պրոֆիլը այլևս չի ցուցադրվի ձեզ։",
+        reply_markup=main_keyboard(user_id)
+    )
+
+# =========================================================
+# SETTINGS / DELETE PROFILE
+# =========================================================
+
+async def settings(update, context):
+    await update.message.reply_text(
+        "⚙️ <b>Կարգավորումներ</b>\n\n"
+        "Այստեղ կարող եք կառավարել ձեր պրոֆիլը։",
+        parse_mode="HTML",
+        reply_markup=settings_keyboard()
+    )
+
+async def delete_confirm(update, context):
+    q = update.callback_query
+    await q.answer()
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Այո, ջնջել պրոֆիլը", callback_data="delete_yes")],
+        [InlineKeyboardButton("⬅️ Չեղարկել", callback_data="home")]
+    ])
+    await q.message.reply_text(
+        "⚠️ <b>Պրոֆիլի մշտական ջնջում</b>\n\n"
+        "Ձեր պրոֆիլը, Match-երը, Like-երը և անձնական տվյալները "
+        "կջնջվեն և գործողությունը հնարավոր չի լինի հետարկել։\n\n"
+        "Շարունակե՞լ։",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+async def delete_profile(update, context):
+    q = update.callback_query
+    await q.answer("Պրոֆիլը ջնջվում է…")
+    user_id = q.from_user.id
+
+    with db() as conn:
+        match_ids = [
+            r["id"] for r in conn.execute(
+                "SELECT id FROM matches WHERE user1=? OR user2=?",
+                (user_id, user_id)
+            ).fetchall()
+        ]
+
+        if match_ids:
+            placeholders = ",".join("?" * len(match_ids))
+            conn.execute(
+                f"DELETE FROM messages WHERE match_id IN ({placeholders})",
+                match_ids
             )
-        else:
-            await q.message.reply_text(text, parse_mode="HTML", reply_markup=profile_buttons(uid))
-        return
 
-    if data == "edit_profile":
-        await q.message.reply_text("✏️ Խմբագրենք պրոֆիլը։")
-        context.user_data.clear()
-        await send_profile_prompt(update, context, editing=True)
-        return
-
-    if data == "delete_profile":
-        await profile_delete_confirm(update, uid)
-        return
-
-    if data == "delete_yes":
-        if user_exists(uid):
-            await delete_profile(update, uid)
-        context.user_data.clear()
-        await q.message.reply_text(
-            "🗑️ <b>Պրոֆիլը ամբողջությամբ ջնջվեց։</b>\n\n"
-            "Եթե ցանկանաս, կարող ես ստեղծել նոր պրոֆիլ։",
-            parse_mode="HTML",
-            reply_markup=start_keyboard(),
+        conn.execute(
+            "DELETE FROM matches WHERE user1=? OR user2=?",
+            (user_id, user_id)
         )
+        conn.execute(
+            "DELETE FROM swipes WHERE from_user=? OR to_user=?",
+            (user_id, user_id)
+        )
+        conn.execute(
+            "DELETE FROM blocks WHERE blocker=? OR blocked=?",
+            (user_id, user_id)
+        )
+        conn.execute(
+            "DELETE FROM reports WHERE reporter=? OR reported=?",
+            (user_id, user_id)
+        )
+        conn.execute(
+            "DELETE FROM activity_logs WHERE user_id=?",
+            (user_id,)
+        )
+        conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+
+    context.user_data.clear()
+
+    await q.message.reply_text(
+        "🗑️ Ձեր Together պրոֆիլը ամբողջությամբ ջնջվեց։\n\n"
+        "Եթե ցանկանաք վերադառնալ, օգտագործեք /start։"
+    )
+
+# =========================================================
+# ADMIN
+# =========================================================
+
+async def admin_menu(update, context):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    await update.message.reply_text(
+        "🛡️ <b>Admin մենյու</b>",
+        parse_mode="HTML",
+        reply_markup=admin_keyboard()
+    )
+
+async def admin_callback(update, context):
+    q = update.callback_query
+    await q.answer()
+
+    if q.from_user.id != ADMIN_ID:
         return
 
-    if data.startswith(("like:", "pass:", "super:")):
-        action, target = data.split(":")
-        await process_swipe(update, context, action, int(target))
+    action = q.data.split(":")[1]
+
+    if action == "activity_toggle":
+        enabled = not activity_notifications_enabled()
+        set_activity_notifications(enabled)
+        log_activity(ADMIN_ID, "activity_notifications_toggle")
+        await q.message.edit_reply_markup(reply_markup=admin_keyboard())
         return
 
-    if data.startswith("chat:"):
-        await open_chat(update, uid, int(data.split(":")[1]))
-        return
+    with db() as conn:
+        if action == "stats":
+            users = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+            active = conn.execute(
+                "SELECT COUNT(*) c FROM users WHERE last_active>=?",
+                ((datetime.utcnow() - timedelta(days=7)).isoformat(timespec="seconds"),)
+            ).fetchone()["c"]
+            matches = conn.execute("SELECT COUNT(*) c FROM matches").fetchone()["c"]
+            messages = conn.execute("SELECT COUNT(*) c FROM messages").fetchone()["c"]
+            reports = conn.execute("SELECT COUNT(*) c FROM reports WHERE status='new'").fetchone()["c"]
 
-    if data.startswith("block:"):
-        target = int(data.split(":")[1])
-        if target != uid and user_exists(target):
-            with db() as con:
-                con.execute(
-                    "INSERT OR IGNORE INTO blocks(blocker,blocked,created_at) VALUES(?,?,?)",
-                    (uid, target, now()),
+            text = (
+                "📊 <b>Վիճակագրություն</b>\n\n"
+                f"👥 Օգտատերեր՝ {users}\n"
+                f"🟢 Ակտիվ՝ {active}\n"
+                f"❤️ Match-եր՝ {matches}\n"
+                f"💬 Հաղորդագրություններ՝ {messages}\n"
+                f"🚨 Նոր հաղորդումներ՝ {reports}"
+            )
+            await q.message.reply_text(text, parse_mode="HTML")
+
+        elif action == "users":
+            rows = conn.execute(
+                "SELECT id, name, city, banned FROM users ORDER BY created_at DESC LIMIT 20"
+            ).fetchall()
+            if not rows:
+                await q.message.reply_text("Օգտատերեր չկան։")
+                return
+            lines = ["👥 <b>Վերջին օգտատերերը</b>\n"]
+            for r in rows:
+                status = "🚫" if r["banned"] else "🟢"
+                lines.append(f"{status} {r['id']} — {r['name'] or 'Անուն չկա'} — {r['city'] or '-'}")
+            await q.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+        elif action == "reports":
+            rows = conn.execute("""
+                SELECT reporter, reported, reason, created_at
+                FROM reports
+                WHERE status='new'
+                ORDER BY created_at DESC
+                LIMIT 20
+            """).fetchall()
+            if not rows:
+                await q.message.reply_text("🚨 Նոր հաղորդումներ չկան։")
+                return
+            lines = ["🚨 <b>Հաղորդումներ</b>\n"]
+            for r in rows:
+                lines.append(
+                    f"👤 {r['reporter']} → {r['reported']}\n"
+                    f"📝 {r['reason']}\n"
+                    f"🕒 {r['created_at']}"
                 )
-                con.execute(
-                    "DELETE FROM matches WHERE (user1=? AND user2=?) OR (user1=? AND user2=?)",
-                    (uid, target, target, uid),
-                )
-            clear_chat(uid)
-            await q.message.reply_text(
-                "🚫 Օգտատերը արգելափակվեց։",
-                reply_markup=main_keyboard(uid),
-            )
-            await admin_activity(context.application, uid, "Օգտատերը արգելափակեց", str(target))
-        return
+            await q.message.reply_text("\n\n".join(lines), parse_mode="HTML")
 
-    if data.startswith("report:"):
-        target = int(data.split(":")[1])
-        await q.message.reply_text(
-            "⚠️ Ընտրիր բողոքի պատճառը։",
-            reply_markup=await report_menu(update, target),
-        )
-        return
+# =========================================================
+# COMMANDS
+# =========================================================
 
-    if data.startswith("report_reason:"):
-        _, target, reason = data.split(":", 2)
-        target = int(target)
-        with db() as con:
-            con.execute(
-                "INSERT INTO reports(reporter,reported,reason,created_at) VALUES(?,?,?,?)",
-                (uid, target, reason, now()),
-            )
-        await q.message.reply_text(
-            "✅ Բողոքը ուղարկվեց։ Շնորհակալություն։",
-            reply_markup=main_keyboard(uid),
-        )
-        await admin_activity(context.application, uid, "Բողոք ուղարկվեց", f"{target}: {reason}")
-        return
+async def admin_command(update, context):
+    await admin_menu(update, context)
 
-    if data == "admin_stats" and uid == ADMIN_ID:
-        await admin_stats(update)
-        return
+async def cancel(update, context):
+    context.user_data.clear()
+    await home(update, context)
+    return ConversationHandler.END
 
-    if data == "admin_users" and uid == ADMIN_ID:
-        await admin_users(update)
-        return
-
-    if data == "admin_reports" and uid == ADMIN_ID:
-        await admin_reports(update)
-        return
-
-    if data == "admin_backup" and uid == ADMIN_ID:
-        await admin_backup(update)
-        return
-
-    if data == "admin_toggle_activity" and uid == ADMIN_ID:
-        new_value = "0" if activity_notifications_enabled() else "1"
-        with db() as con:
-            con.execute("""
-                INSERT INTO bot_settings(key,value) VALUES('activity_notifications',?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value
-            """, (new_value,))
-        await q.message.reply_text(
-            "🔔 Ակտիվության հաղորդագրությունները "
-            + ("միացված են։" if new_value == "1" else "անջատված են։")
-        )
-        return
-
+# =========================================================
+# TEXT ROUTER
+# =========================================================
 
 async def text_router(update, context):
-    uid = update.effective_user.id
-    text = (update.effective_message.text or "").strip()
+    user_id = update.effective_user.id
+    ensure_user(update.effective_user)
 
-    # Main menu buttons always have priority.
-    if text == "🚀 Ստեղծել պրոֆիլ":
-        context.user_data.clear()
-        await send_profile_prompt(update, context)
+    if is_banned(user_id):
+        await update.message.reply_text("🚫 Ձեր պրոֆիլը արգելափակված է։")
         return
+
+    touch(user_id)
+
+    # Active chat gets priority.
+    if context.user_data.get("chat_match_id"):
+        handled = await send_chat_message(update, context)
+        if handled:
+            return
+
+    text = update.message.text.strip()
 
     if text == "👤 Իմ պրոֆիլը":
-        if not user_exists(uid):
-            await update.effective_message.reply_text("Սկզբում ստեղծիր պրոֆիլ։", reply_markup=start_keyboard())
-            return
-        u = get_user(uid)
-        if u["photo_file_id"]:
-            await update.effective_message.reply_photo(
-                u["photo_file_id"], caption=profile_text(u), parse_mode="HTML",
-                reply_markup=profile_buttons(uid)
-            )
-        else:
-            await update.effective_message.reply_text(
-                profile_text(u), parse_mode="HTML", reply_markup=profile_buttons(uid)
-            )
-        return
-
-    if text == "🔎 Գտնել մարդկանց":
-        if not user_exists(uid):
-            await update.effective_message.reply_text("Սկզբում ստեղծիր պրոֆիլ։", reply_markup=start_keyboard())
-            return
-        touch(uid)
-        await show_candidate(update, uid)
-        return
-
-    if text == "❤️ Իմ Match-երը":
-        if user_exists(uid):
-            await show_matches(update, uid)
-        return
-
-    if text == "✏️ Խմբագրել պրոֆիլը":
-        if user_exists(uid):
-            context.user_data.clear()
-            await send_profile_prompt(update, context, editing=True)
-        return
-
-    if text == "🗑️ Ջնջել պրոֆիլը":
-        if user_exists(uid):
-            await profile_delete_confirm(update, context)
-        return
-
-    if text == "🛡️ Admin մենյու" and uid == ADMIN_ID:
-        await admin_menu(update)
-        return
-
-    if text == "❌ Փակել չատը":
-        clear_chat(uid)
-        await update.effective_message.reply_text(
-            "❌ Չատը փակվեց։",
-            reply_markup=main_keyboard(uid),
-        )
-        return
-
-    if await forward_chat_message(update, uid, text, context):
-        return
-
-    if context.user_data.get("profile_step"):
-        handled = await handle_profile_step(update, context)
-        if handled:
-            touch(uid)
-            return
-
-    if user_exists(uid):
-        touch(uid)
-        await update.effective_message.reply_text(
-            "Ընտրիր գործողությունը մենյուից։",
-            reply_markup=main_keyboard(uid),
-        )
+        await show_profile(update, context)
+    elif text == "🔎 Գտնել մարդկանց":
+        await discover(update, context)
+    elif text == "❤️ Իմ Match-երը":
+        await show_matches(update, context)
+    elif text == "✏️ Խմբագրել պրոֆիլը":
+        await edit_profile(update, context)
+    elif text == "⚙️ Կարգավորումներ":
+        await settings(update, context)
+    elif text == "🛡️ Admin մենյու" and user_id == ADMIN_ID:
+        await admin_menu(update, context)
     else:
-        await update.effective_message.reply_text(
-            "Սկզբում ստեղծիր պրոֆիլ։",
-            reply_markup=start_keyboard(),
+        await update.message.reply_text(
+            "Խնդրում եմ ընտրեք գործողությունը կոճակներից։",
+            reply_markup=main_keyboard(user_id)
         )
 
+# =========================================================
+# CALLBACK ROUTER
+# =========================================================
 
-async def photo_router(update, context):
-    if await handle_photo(update, context):
+async def callback_router(update, context):
+    q = update.callback_query
+    data = q.data
+
+    if data in ("like", "super", "pass"):
         return
-    uid = update.effective_user.id
-    if user_exists(uid):
-        await update.effective_message.reply_text(
-            "Այս պահին լուսանկար պետք չէ։",
-            reply_markup=main_keyboard(uid),
-        )
 
+    if data.startswith(("like:", "super:", "pass:")):
+        await swipe(update, context)
+    elif data == "discover_next":
+        await q.answer()
+        await q.message.reply_text("🔎 Փնտրում եմ…")
+        # Discovery uses callback message context, so use direct helper.
+        user_id = q.from_user.id
+        candidate = next_candidate(user_id)
+        if not candidate:
+            await q.message.reply_text("🔎 Այս պահին նոր համապատասխան պրոֆիլ չկա։")
+            return
+        context.user_data["candidate_id"] = candidate["id"]
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("❤️ Հավանել", callback_data=f"like:{candidate['id']}"),
+                InlineKeyboardButton("🔥 Super Like", callback_data=f"super:{candidate['id']}")
+            ],
+            [InlineKeyboardButton("👎 Հաջորդը", callback_data=f"pass:{candidate['id']}")],
+            [
+                InlineKeyboardButton("🚨 Հաղորդել", callback_data=f"report_menu:{candidate['id']}"),
+                InlineKeyboardButton("🚫 Արգելափակել", callback_data=f"block:{candidate['id']}")
+            ]
+        ])
+        text = profile_text(candidate)
+        if candidate["photo_file_id"]:
+            await q.message.reply_photo(candidate["photo_file_id"], caption=text, parse_mode="HTML", reply_markup=keyboard)
+        else:
+            await q.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
-async def admin_cmd(update, context):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    await admin_menu(update)
+    elif data.startswith("chat:"):
+        await open_chat(update, context)
+    elif data.startswith("report_menu:"):
+        await report_menu(update, context)
+    elif data.startswith("report:"):
+        await report_user(update, context)
+    elif data.startswith("block:"):
+        await block_user(update, context)
+    elif data == "delete_profile":
+        await delete_confirm(update, context)
+    elif data == "delete_yes":
+        await delete_profile(update, context)
+    elif data.startswith("admin:"):
+        await admin_callback(update, context)
+    elif data == "home":
+        await q.answer()
+        context.user_data.clear()
+        await home(update, context)
 
-
-async def ban_cmd(update, context):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    if not context.args:
-        await update.effective_message.reply_text("Օգտագործում՝ /ban USER_ID")
-        return
-    try:
-        target = int(context.args[0])
-    except ValueError:
-        await update.effective_message.reply_text("Սխալ ID։")
-        return
-    with db() as con:
-        con.execute("UPDATE users SET banned=1 WHERE id=?", (target,))
-    await update.effective_message.reply_text(f"🚫 Արգելափակված՝ {target}")
-
-
-async def unban_cmd(update, context):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    if not context.args:
-        await update.effective_message.reply_text("Օգտագործում՝ /unban USER_ID")
-        return
-    try:
-        target = int(context.args[0])
-    except ValueError:
-        await update.effective_message.reply_text("Սխալ ID։")
-        return
-    with db() as con:
-        con.execute("UPDATE users SET banned=0 WHERE id=?", (target,))
-    await update.effective_message.reply_text(f"✅ Ապաբլոկավորված՝ {target}")
-
-
-async def post_init(app):
-    init_db()
-    app.create_task(inactivity_cleanup_loop(app))
-
+# =========================================================
+# ERROR
+# =========================================================
 
 async def error_handler(update, context):
     log.exception("Unhandled error", exc_info=context.error)
+    if ADMIN_ID:
+        try:
+            await context.bot.send_message(
+                ADMIN_ID,
+                f"❌ Together error:\n{type(context.error).__name__}: {context.error}"
+            )
+        except Exception:
+            pass
 
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable is required")
+        raise RuntimeError("BOT_TOKEN environment variable is missing.")
 
     init_db()
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    conversation = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", start),
+            MessageHandler(filters.Regex("^✏️ Խմբագրել պրոֆիլը$"), edit_profile),
+        ],
+        states={
+            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, name_step)],
+            AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, age_step)],
+            CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, city_step)],
+            GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, gender_step)],
+            LOOKING_FOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, looking_step)],
+            ABOUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, about_step)],
+            PHOTO: [MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), photo_step)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex("^⬅️ Չեղարկել$"), cancel),
+        ],
+        allow_reentry=True,
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CommandHandler("admin", admin_cmd))
-    app.add_handler(CommandHandler("ban", ban_cmd))
-    app.add_handler(CommandHandler("unban", unban_cmd))
-    app.add_handler(CallbackQueryHandler(callback))
-    app.add_handler(MessageHandler(filters.PHOTO, photo_router))
+    app.add_handler(conversation)
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+    app.add_handler(MessageHandler(filters.PHOTO, text_router))
     app.add_error_handler(error_handler)
 
-    log.info("%s started", BOT_NAME)
-    app.run_polling(drop_pending_updates=True)
+    # 30-second checker; actual chat timeout is 180 seconds.
+    app.job_queue.run_repeating(
+        inactivity_cleanup,
+        interval=30,
+        first=30
+    )
 
+    log.info("Together bot started")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
