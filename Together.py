@@ -33,7 +33,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 DB_FILE = os.getenv("DB_FILE", "/data/together.db")
 
-# 3 minutes -> delete temporary general bot UI; Match chats remain intact
+# 3 minutes -> delete temporary general bot UI; Հավանության չատերը remain intact
 UI_CLEANUP_SECONDS = 180
 
 # A profile is considered active for discovery for 7 days
@@ -99,8 +99,8 @@ async def send_ui_photo(update, context, *args, **kwargs):
 async def cleanup_ui_messages(context):
     """Delete temporary bot UI messages older than three minutes.
 
-    Match conversation messages are deliberately never registered here.
-    Therefore this cleanup cannot delete Match conversation history.
+    Հավանության զրույցի messages are deliberately never registered here.
+    Therefore this cleanup cannot delete Հավանության զրույցի history.
     """
     app = context.application
     store = _ui_store(app)
@@ -568,6 +568,41 @@ def get_user_matches(user_id):
         """, (user_id, user_id, user_id)).fetchall()
 
 
+def delete_match_for_user(user_id, match_id):
+    """Remove a user's Հավանություն connection and its chat history.
+
+    Both swipe records are removed too, so the profiles can appear again in
+    discovery and a new Հավանություն can be created later.
+    """
+    with db() as conn:
+        match = conn.execute(
+            "SELECT * FROM matches WHERE id=?",
+            (match_id,),
+        ).fetchone()
+
+        if not match:
+            return None
+
+        if int(user_id) not in (int(match["user1"]), int(match["user2"])):
+            return None
+
+        other_id = (
+            int(match["user2"])
+            if int(match["user1"]) == int(user_id)
+            else int(match["user1"])
+        )
+
+        conn.execute("DELETE FROM messages WHERE match_id=?", (match_id,))
+        conn.execute("DELETE FROM matches WHERE id=?", (match_id,))
+        conn.execute(
+            "DELETE FROM swipes WHERE "
+            "(from_user=? AND to_user=?) OR (from_user=? AND to_user=?)",
+            (user_id, other_id, other_id, user_id),
+        )
+
+        return other_id
+
+
 def is_blocked(user1, user2):
     with db() as conn:
         row = conn.execute("""
@@ -768,7 +803,7 @@ def main_keyboard(is_admin=False):
         ],
         [
             InlineKeyboardButton(
-                "❤️ Իմ Match-երը",
+                "❤️ Իմ Հավանությունները",
                 callback_data="matches",
             ),
             InlineKeyboardButton(
@@ -805,7 +840,7 @@ def main_keyboard(is_admin=False):
 def reply_main_keyboard(is_admin=False):
     rows = [
         ["👤 Իմ պրոֆիլը", "🔎 Գտնել մարդկանց"],
-        ["❤️ Իմ Match-երը", "✏️ Խմբագրել պրոֆիլը"],
+        ["❤️ Իմ Հավանությունները", "✏️ Խմբագրել պրոֆիլը"],
         ["🚫 Բլոկավորվածներ", "⚙️ Կարգավորումներ"],
         ["💎 Premium"],
     ]
@@ -1034,7 +1069,7 @@ async def home(update, context, edit=False):
     text = (
         "💙 <b>Բարի գալուստ Together</b>\n\n"
         "Այստեղ կարող ես գտնել նոր մարդկանց, "
-        "ստեղծել Match և սկսել շփվել։\n\n"
+        "ստեղծել Հավանություն և սկսել շփվել։\n\n"
         "Ընտրիր գործողությունը 👇"
     )
 
@@ -1236,14 +1271,19 @@ async def handle_profile_text(update, context):
             )
             return True
 
-        update_user(user_id, gender=gender)
-        context.user_data["step"] = "looking_for"
+        # Որոնվող սեռը ավտոմատ հակառակ սեռն է։ Օգտատերը այլևս չի
+        # կարող ընտրել նույն կամ մեկ այլ սեռ ձեռքով։
+        looking_for = "Կին" if gender == "Տղամարդ" else "Տղամարդ"
+        update_user(user_id, gender=gender, looking_for=looking_for)
+        context.user_data["step"] = "about"
 
         await send_ui_message(update, context, 
-            "❤️ <b>Քայլ 5/7</b>\n\n"
-            "Ո՞ւմ ես փնտրում։",
+            "📝 <b>Քայլ 5/6</b>\n\n"
+            f"Քո սեռը՝ <b>{html.escape(gender)}</b>։\n"
+            f"Փնտրում ես՝ <b>{html.escape(looking_for)}</b>։\n\n"
+            "Մի փոքր պատմիր քո մասին։",
             parse_mode="HTML",
-            reply_markup=looking_keyboard(),
+            reply_markup=ReplyKeyboardRemove(),
         )
         return True
 
@@ -1266,7 +1306,7 @@ async def handle_profile_text(update, context):
         context.user_data["step"] = "about"
 
         await send_ui_message(update, context, 
-            "📝 <b>Քայլ 6/7</b>\n\n"
+            "📝 <b>Քայլ 5/6</b>\n\n"
             "Մի փոքր պատմիր քո մասին։",
             parse_mode="HTML",
             reply_markup=ReplyKeyboardRemove(),
@@ -1284,7 +1324,7 @@ async def handle_profile_text(update, context):
         context.user_data["step"] = "photo"
 
         await send_ui_message(update, context, 
-            "📸 <b>Քայլ 7/7</b>\n\n"
+            "📸 <b>Քայլ 6/6</b>\n\n"
             "Ուղարկիր քո լուսանկարը։\n\n"
             "Լուսանկարը պարտադիր է պրոֆիլը ավարտելու համար։",
             parse_mode="HTML",
@@ -1466,7 +1506,7 @@ async def show_next_profile(update, context):
             )
         return
 
-    text = profile_text(candidate, "🔎 Հնարավոր Match")
+    text = profile_text(candidate, "🔎 Հնարավոր Հավանություն")
 
     if update.callback_query:
         try:
@@ -1553,7 +1593,7 @@ async def process_swipe(update, context, action, target_id):
         other = get_user(target_id)
 
         await update.callback_query.answer(
-            "🎉 Match!",
+            "🎉 Հավանություն!",
             show_alert=True,
         )
 
@@ -1563,7 +1603,7 @@ async def process_swipe(update, context, action, target_id):
             pass
 
         await send_ui_chat_message(update, context,
-            "🎉 <b>Դուք Match եք!</b>\n\n"
+            "🎉 <b>Դուք Հավանություն ունեք!</b>\n\n"
             f"❤️ Դու և <b>{html.escape(str(other['name']))}</b> "
             "հավանել եք միմյանց։\n\n"
             "Սկսիր զրույցը 👇",
@@ -1575,7 +1615,7 @@ async def process_swipe(update, context, action, target_id):
             await context.bot.send_message(
                 chat_id=target_id,
                 text=(
-                    "🎉 <b>Նոր Match!</b>\n\n"
+                    "🎉 <b>Նոր Հավանություն!</b>\n\n"
                     f"❤️ <b>{html.escape(str(get_user(user_id)['name']))}</b> "
                     "նույնպես հավանել է քեզ։\n\n"
                     "Բացիր չատը 👇"
@@ -1589,7 +1629,7 @@ async def process_swipe(update, context, action, target_id):
         await log_activity(
             user_id,
             "match_created",
-            f"Match ID՝ {match['id']}, օգտատեր՝ {target_id}",
+            f"Հավանության ID՝ {match['id']}, օգտատեր՝ {target_id}",
             context=context,
             notify=True,
         )
@@ -1611,8 +1651,8 @@ async def show_matches(update, context):
 
     if not rows:
         text = (
-            "❤️ <b>Իմ Match-երը</b>\n\n"
-            "Դեռ Match չունես։\n"
+            "❤️ <b>Իմ Հավանությունները</b>\n\n"
+            "Դեռ Հավանություն չունես։\n"
             "Գնա «🔎 Գտնել մարդկանց» և սկսիր։"
         )
 
@@ -1656,7 +1696,11 @@ async def show_matches(update, context):
             InlineKeyboardButton(
                 f"❤️ {other['name']} · {other['age']}",
                 callback_data=f"chat:{row['id']}",
-            )
+            ),
+            InlineKeyboardButton(
+                "🗑 Ջնջել",
+                callback_data=f"delete_match:{row['id']}",
+            ),
         ])
 
     buttons.append([
@@ -1669,8 +1713,8 @@ async def show_matches(update, context):
     markup = InlineKeyboardMarkup(buttons)
 
     text = (
-        "❤️ <b>Իմ Match-երը</b>\n\n"
-        "Ընտրիր Match-ը՝ զրույցը բացելու համար։"
+        "❤️ <b>Իմ Հավանությունները</b>\n\n"
+        "Ընտրիր Հավանությունը՝ զրույցը բացելու համար։"
     )
 
     if update.callback_query:
@@ -1707,14 +1751,14 @@ async def open_chat(update, context, match_id):
 
     if not match:
         await update.callback_query.answer(
-            "Match-ը չի գտնվել։",
+            "Հավանությունը չի գտնվել։",
             show_alert=True,
         )
         return
 
     if user_id not in (match["user1"], match["user2"]):
         await update.callback_query.answer(
-            "Դու այս Match-ի մասնակից չես։",
+            "Դու այս Հավանության մասնակից չես։",
             show_alert=True,
         )
         return
@@ -1731,7 +1775,7 @@ async def open_chat(update, context, match_id):
             f"❤️ Զրուցում ես <b>{html.escape(str(other['name']))}</b>-ի հետ։\n\n"
             "Ուղարկիր հաղորդագրություն։\n"
             "⏱️ Եթե 3 րոպե ոչ ոք չգրի, չատը ավտոմատ կփակվի։\n\n"
-            "Match-ը կմնա պահպանված։",
+            "Հավանությունը կմնա պահպանված։",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [
@@ -1746,7 +1790,7 @@ async def open_chat(update, context, match_id):
                 ],
                 [
                     InlineKeyboardButton(
-                        "❤️ Իմ Match-երը",
+                        "❤️ Իմ Հավանությունները",
                         callback_data="matches",
                     ),
                     InlineKeyboardButton(
@@ -1822,7 +1866,7 @@ async def handle_chat_message(update, context):
     await log_activity(
         user_id,
         "chat_message",
-        f"Match ID՝ {match_id}",
+        f"Հավանության ID՝ {match_id}",
         context=context,
         notify=False,
     )
@@ -2240,7 +2284,7 @@ async def admin_stats(update, context):
         f"❤️ Likes՝ <b>{likes}</b>\n"
         f"⭐ Super Likes՝ <b>{superlikes}</b>\n"
         f"❌ Pass՝ <b>{passes}</b>\n"
-        f"❤️ Matches՝ <b>{matches}</b>\n"
+        f"❤️ Հավանությունes՝ <b>{matches}</b>\n"
         f"💬 Հաղորդագրություններ՝ <b>{messages}</b>\n"
         f"👁️ Պրոֆիլի դիտումներ՝ <b>{views}</b>\n"
         f"🚨 Բաց հաղորդումներ՝ <b>{reports}</b>"
@@ -2361,7 +2405,7 @@ async def admin_tiktok_stats(update, context):
         f"📈 Պրոֆիլի ավարտման տոկոս՝ <b>{completion_rate:.1f}%</b>\n\n"
         f"❤️ TikTok օգտատերերի ուղարկած Like/Super Like՝ <b>{likes_sent}</b>\n"
         f"💗 TikTok օգտատերերի ստացած Like/Super Like՝ <b>{likes_received}</b>\n"
-        f"🎉 TikTok օգտատերերի մասնակցությամբ Match-եր՝ <b>{matches}</b>"
+        f"🎉 TikTok օգտատերերի մասնակցությամբ Հավանություն-եր՝ <b>{matches}</b>"
     )
 
     await update.callback_query.edit_message_text(
@@ -2672,7 +2716,7 @@ async def admin_payments(update, context):
 async def inactivity_cleanup(context):
     """Delete temporary bot UI messages after 3 minutes.
 
-    This does NOT close Match chats and does NOT delete Match messages.
+    This does NOT close Հավանության չատերը and does NOT delete Հավանություն messages.
     """
     await cleanup_ui_messages(context)
 
@@ -2764,7 +2808,32 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # --------------------------------------------------------
-    # Match chat
+    # Հավանության ջնջում
+    # --------------------------------------------------------
+    if data.startswith("delete_match:"):
+        try:
+            match_id = int(data.split(":", 1)[1])
+        except ValueError:
+            return
+
+        deleted = delete_match_for_user(user_id, match_id)
+        if deleted is None:
+            await query.answer("Հավանությունը չի գտնվել։", show_alert=True)
+            return
+
+        await log_activity(
+            user_id,
+            "match_deleted",
+            f"Ջնջված Հավանության ID՝ {match_id}, օգտատեր՝ {deleted}",
+            context=context,
+            notify=False,
+        )
+        await query.answer("Հավանությունը ջնջվեց։")
+        await show_matches(update, context)
+        return
+
+    # --------------------------------------------------------
+    # Հավանություն chat
     # --------------------------------------------------------
     if data.startswith("chat:"):
         match_id = data.split(":", 1)[1]
@@ -2860,7 +2929,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     touch(user_id)
 
-    # General bot UI messages are temporary. Match chat messages are not.
+    # General bot UI messages are temporary. Հավանություն chat messages are not.
     if not context.user_data.get("chat_match_id"):
         incoming = update.effective_message
         if incoming is not None:
@@ -2891,14 +2960,14 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_next_profile(update, context)
         return
 
-    if text == "❤️ Իմ Match-երը":
+    if text == "❤️ Իմ Հավանությունները":
         # Reuse a synthetic flow by sending a regular message.
         rows = get_user_matches(user_id)
 
         if not rows:
             await send_ui_message(update, context, 
-                "❤️ <b>Իմ Match-երը</b>\n\n"
-                "Դեռ Match չունես։",
+                "❤️ <b>Իմ Հավանությունները</b>\n\n"
+                "Դեռ Հավանություն չունես։",
                 parse_mode="HTML",
                 reply_markup=main_keyboard(user_id == ADMIN_ID),
             )
@@ -2913,7 +2982,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     InlineKeyboardButton(
                         f"❤️ {other['name']} · {other['age']}",
                         callback_data=f"chat:{row['id']}",
-                    )
+                    ),
+                    InlineKeyboardButton(
+                        "🗑 Ջնջել",
+                        callback_data=f"delete_match:{row['id']}",
+                    ),
                 ])
 
         buttons.append([
@@ -2924,8 +2997,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
 
         await send_ui_message(update, context, 
-            "❤️ <b>Իմ Match-երը</b>\n\n"
-            "Ընտրիր Match-ը։",
+            "❤️ <b>Իմ Հավանությունները</b>\n\n"
+            "Ընտրիր Հավանությունը։",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
@@ -3040,8 +3113,8 @@ async def help_command(update, context):
         "ℹ️ <b>Together</b>\n\n"
         "👤 Ստեղծիր և խմբագրիր պրոֆիլդ\n"
         "🔎 Գտիր մարդկանց\n"
-        "❤️ Ստեղծիր Match\n"
-        "💬 Շփվիր Match-երիդ հետ\n"
+        "❤️ Ստեղծիր Հավանություն\n"
+        "💬 Շփվիր Հավանություն-երիդ հետ\n"
         "🚫 Բլոկավորիր օգտատերերին\n"
         "🚨 Ուղարկիր հաղորդումներ\n\n"
         "Սկսելու համար՝ /start",
