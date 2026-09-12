@@ -49,7 +49,7 @@ logger = logging.getLogger("togethr")
 # ============================================================
 
 def _ui_store(application):
-    return getattr(application, "togethr_ui_messages", {})
+    return application.bot_data.setdefault("togethr_ui_messages", {})
 
 
 def track_ui_message(context, message):
@@ -2879,8 +2879,8 @@ async def cancel_command(update, context):
 async def post_init(application):
     init_db()
 
-    # Temporary bot UI registry used by the 3-minute cleanup.
-    application.togethr_ui_messages = {}
+    # Temporary bot UI registry is stored in PTB bot_data (Application uses slots).
+    application.bot_data["togethr_ui_messages"] = {}
 
     if application.job_queue:
         application.job_queue.run_repeating(
