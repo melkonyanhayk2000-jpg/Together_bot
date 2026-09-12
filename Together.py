@@ -10,12 +10,14 @@ from telegram import (
     ReplyKeyboardRemove,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    LabeledPrice,
 )
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    PreCheckoutQueryHandler,
     ConversationHandler,
     ContextTypes,
     filters,
@@ -31,11 +33,17 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 DB_FILE = os.getenv("DB_FILE", "/data/together.db")
 
-# 3 minutes inactivity -> close active chat, Match remains
+# 3 minutes -> delete temporary general bot UI; Match chats remain intact
 UI_CLEANUP_SECONDS = 180
 
 # A profile is considered active for discovery for 7 days
 ACTIVE_DAYS = 7
+
+PREMIUM_PLANS = {
+    "premium_7": {"title": "Premium 7 օր", "days": 7, "stars": 100},
+    "premium_30": {"title": "Premium 30 օր", "days": 30, "stars": 300},
+    "premium_90": {"title": "Premium 90 օր", "days": 90, "stars": 750},
+}
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -244,6 +252,23 @@ def init_db():
             INSERT OR IGNORE INTO bot_settings(key, value)
             VALUES ('activity_notifications', '1')
         """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                plan TEXT,
+                stars INTEGER NOT NULL,
+                currency TEXT NOT NULL,
+                telegram_payment_charge_id TEXT UNIQUE,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "premium_until" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN premium_until TEXT")
 
         # Migration for databases created by older Together.py versions.
         try:
@@ -761,6 +786,9 @@ def main_keyboard(is_admin=False):
                 callback_data="settings",
             ),
         ],
+        [
+            InlineKeyboardButton("💎 Premium", callback_data="premium"),
+        ],
     ]
 
     if is_admin:
@@ -779,6 +807,7 @@ def reply_main_keyboard(is_admin=False):
         ["👤 Իմ պրոֆիլը", "🔎 Գտնել մարդկանց"],
         ["❤️ Իմ Match-երը", "✏️ Խմբագրել պրոֆիլը"],
         ["🚫 Բլոկավորվածներ", "⚙️ Կարգավորումներ"],
+        ["💎 Premium"],
     ]
 
     if is_admin:
@@ -901,6 +930,9 @@ def admin_keyboard():
                 "🎵 TikTok վիճակագրություն",
                 callback_data="admin:tiktok",
             ),
+        ],
+        [
+            InlineKeyboardButton("💳 Վճարումներ", callback_data="admin:payments"),
         ],
         [
             InlineKeyboardButton(
@@ -2481,8 +2513,156 @@ async def admin_callback(update, context, action):
         await admin_users(update, context)
     elif action == "reports":
         await admin_reports(update, context)
+    elif action == "payments":
+        await admin_payments(update, context)
     elif action == "activity_toggle":
         await admin_activity_toggle(update, context)
+
+
+# ============================================================
+# TELEGRAM STARS / PREMIUM PAYMENTS
+# ============================================================
+
+def premium_until(user_id):
+    row = get_user(user_id)
+    if not row or not row["premium_until"]:
+        return None
+    try:
+        value = datetime.fromisoformat(row["premium_until"])
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def is_premium(user_id):
+    until = premium_until(user_id)
+    return bool(until and until > utc_now())
+
+
+def premium_status_text(user_id):
+    until = premium_until(user_id)
+    if until and until > utc_now():
+        return f"💎 <b>Premium ակտիվ է</b>\nՄինչև՝ <b>{fmt_time(until.isoformat())}</b>"
+    return "💎 <b>Premium ակտիվ չէ</b>"
+
+
+def premium_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💎 Premium 7 օր — 100 ⭐", callback_data="buy:premium_7")],
+        [InlineKeyboardButton("💎 Premium 30 օր — 300 ⭐", callback_data="buy:premium_30")],
+        [InlineKeyboardButton("💎 Premium 90 օր — 750 ⭐", callback_data="buy:premium_90")],
+        [InlineKeyboardButton("⬅️ Գլխավոր", callback_data="home")],
+    ])
+
+
+async def show_premium(update, context):
+    user_id = update.effective_user.id
+    text = (
+        "💎 <b>Together Premium</b>\n\n"
+        "✨ Premium-ի առավելությունները՝\n"
+        "• ⭐ Super Like-ի ընդլայնված օգտագործում\n"
+        "• 🚀 Premium նշան պրոֆիլում\n"
+        "• 👀 Առաջնահերթ հասանելիություն նոր ֆունկցիաներին\n"
+        "• 🔥 Premium օգտատիրոջ կարգավիճակ\n\n"
+        f"{premium_status_text(user_id)}\n\n"
+        "Ընտրիր փաթեթը։ Վճարումը կատարվում է Telegram Stars-ով։"
+    )
+    if getattr(update, "callback_query", None):
+        await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=premium_keyboard())
+    else:
+        await send_ui_message(update, context, text, parse_mode="HTML", reply_markup=premium_keyboard())
+
+
+async def send_premium_invoice(update, context, plan_key):
+    plan = PREMIUM_PLANS.get(plan_key)
+    if not plan:
+        await update.callback_query.answer("Փաթեթը գոյություն չունի։", show_alert=True)
+        return
+    user_id = update.effective_user.id
+    payload = f"togethr:{plan_key}:{user_id}"
+    try:
+        message = await update.effective_chat.send_invoice(
+            title=plan["title"],
+            description=f"Together Premium — {plan['days']} օր",
+            payload=payload,
+            currency="XTR",
+            prices=[LabeledPrice(plan["title"], plan["stars"])],
+            provider_token="",
+            start_parameter=f"premium-{plan_key}",
+        )
+        track_ui_message(context, message)
+        await update.callback_query.answer("Վճարման պատուհանը բացվեց։")
+    except Exception:
+        logger.exception("Could not send Stars invoice")
+        await update.callback_query.answer("Չհաջողվեց ստեղծել վճարումը։ Փորձիր կրկին։", show_alert=True)
+
+
+async def precheckout_callback(update, context):
+    query = update.pre_checkout_query
+    parts = (query.invoice_payload or "").split(":")
+    if len(parts) != 3 or parts[0] != "togethr":
+        await query.answer(ok=False, error_message="Վճարման տվյալները սխալ են։")
+        return
+    plan = PREMIUM_PLANS.get(parts[1])
+    try:
+        payload_user_id = int(parts[2])
+    except ValueError:
+        payload_user_id = 0
+    if not plan or payload_user_id != query.from_user.id:
+        await query.answer(ok=False, error_message="Այս վճարումը հնարավոր չէ հաստատել։")
+        return
+    await query.answer(ok=True)
+
+
+async def successful_payment_handler(update, context):
+    payment = update.effective_message.successful_payment
+    user_id = update.effective_user.id
+    parts = (payment.invoice_payload or "").split(":")
+    if len(parts) != 3 or parts[0] != "togethr":
+        logger.warning("Unknown payment payload: %s", payment.invoice_payload)
+        return
+    plan = PREMIUM_PLANS.get(parts[1])
+    if not plan:
+        logger.warning("Unknown premium plan: %s", parts[1])
+        return
+    charge_id = payment.telegram_payment_charge_id
+    with db() as conn:
+        existing = conn.execute("SELECT id FROM payments WHERE telegram_payment_charge_id=?", (charge_id,)).fetchone()
+        if existing:
+            return
+        current_until = premium_until(user_id)
+        base = current_until if current_until and current_until > utc_now() else utc_now()
+        new_until = base + timedelta(days=plan["days"])
+        conn.execute("UPDATE users SET premium_until=? WHERE id=?", (new_until.isoformat(), user_id))
+        conn.execute("""INSERT INTO payments(user_id,payload,plan,stars,currency,telegram_payment_charge_id,created_at) VALUES (?,?,?,?,?,?,?)""",
+                     (user_id, payment.invoice_payload, parts[1], payment.total_amount, payment.currency, charge_id, now_iso()))
+    await log_activity(user_id, "premium_payment", f"{plan['title']} · {payment.total_amount} Stars", context, notify=True)
+    await send_ui_message(update, context,
+        "🎉 <b>Վճարումը հաջողությամբ կատարվեց։</b>\n\n"
+        f"💎 {html.escape(plan['title'])}\n"
+        f"⭐ Վճարված՝ <b>{payment.total_amount} Stars</b>\n"
+        f"📅 Premium-ը ակտիվ է մինչև՝ <b>{fmt_time(new_until.isoformat())}</b>\n\n"
+        "Շնորհակալություն Together-ը օգտագործելու համար ❤️",
+        parse_mode="HTML", reply_markup=main_keyboard(user_id == ADMIN_ID))
+
+
+async def admin_payments(update, context):
+    if not admin_required(update.effective_user.id):
+        return
+    with db() as conn:
+        stats = conn.execute("SELECT COUNT(*) count, COALESCE(SUM(stars),0) stars FROM payments").fetchone()
+        rows = conn.execute("SELECT p.user_id,p.plan,p.stars,p.created_at,u.username,u.name FROM payments p LEFT JOIN users u ON u.id=p.user_id ORDER BY p.id DESC LIMIT 20").fetchall()
+    lines = ["💳 <b>Վճարումների վիճակագրություն</b>\n", f"💰 Ընդհանուր վճարումներ՝ <b>{stats['count']}</b>", f"⭐ Ստացված Stars՝ <b>{stats['stars']}</b>\n"]
+    if rows:
+        lines.append("<b>Վերջին վճարումները</b>\n")
+        for row in rows:
+            username = f"@{row['username']}" if row["username"] else "—"
+            lines.append(f"👤 <code>{row['user_id']}</code> · {html.escape(str(row['name'] or '—'))} · {html.escape(username)}\n💎 {html.escape(str(row['plan']))} · ⭐ {row['stars']} · {fmt_time(row['created_at'])}")
+    else:
+        lines.append("Վճարումներ դեռ չկան։")
+    await update.callback_query.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Admin մենյու", callback_data="admin:menu")]]))
 
 
 # ============================================================
@@ -2539,6 +2719,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "settings":
         await show_settings(update, context)
+        return
+
+    if data == "premium":
+        await show_premium(update, context)
+        return
+
+    if data.startswith("buy:"):
+        await send_premium_invoice(update, context, data.split(":", 1)[1])
         return
 
     if data == "blocked_list":
@@ -2792,6 +2980,10 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if text == "💎 Premium":
+        await show_premium(update, context)
+        return
+
     if text == "🛡️ Admin մենյու" and admin_required(user_id):
         await send_ui_message(update, context, 
             "🛡️ <b>Admin մենյու</b>\n\n"
@@ -2917,6 +3109,17 @@ def build_application():
 
     application.add_handler(
         CommandHandler("cancel", cancel_command)
+    )
+
+    application.add_handler(
+        PreCheckoutQueryHandler(precheckout_callback)
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.SUCCESSFUL_PAYMENT,
+            successful_payment_handler,
+        )
     )
 
     application.add_handler(
